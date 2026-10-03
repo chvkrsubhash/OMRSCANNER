@@ -637,6 +637,71 @@ def sample_pdf():
         download_name=f"sample_{count}q_omr_{suffix}.pdf"
     )
 
+@app.route("/templates/<int:template_id>/sample-key")
+@login_required
+def template_sample_key(template_id):
+    t = get_user_template(template_id, session["user_id"])
+    if not t:
+        abort(404)
+    cfg = json.loads(t["config_json"])
+    count = cfg.get("question_count", 100)
+    opts = cfg.get("options", ["A", "B", "C", "D"])
+    answers = [opts[i % len(opts)] for i in range(count)]
+    lines = [
+        f"# OMR Answer Key for: {t['name']}",
+        f"# Total Questions: {count}",
+        f"# Options: {', '.join(opts)}",
+        "# You can paste this text directly into the 'Answer key' field when scanning.",
+        "",
+        ", ".join(answers),
+        "",
+        "# Numbered format alternative:",
+        *(f"{i+1}. {ans}" for i, ans in enumerate(answers))
+    ]
+    safe_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", t["name"].strip()).strip("_")
+    return send_file(
+        io.BytesIO("\n".join(lines).encode("utf-8")),
+        mimetype="text/plain",
+        as_attachment=True,
+        download_name=f"{safe_name}_answer_key_{count}q.txt"
+    )
+
+@app.route("/sample-key")
+def download_sample_key():
+    count = request.args.get("count", 100, type=int)
+    if count not in (30, 50, 60, 100, 120, 125, 150, 200):
+        count = 100
+    opts = ["A", "B", "C", "D"]
+    answers = [opts[i % len(opts)] for i in range(count)]
+    lines = [
+        f"# Sample OMR Answer Key ({count} Questions)",
+        "# Valid Options: A, B, C, D",
+        "# Format: comma-separated or numbered lines",
+        "",
+        ", ".join(answers),
+        "",
+        "# Numbered format alternative:",
+        *(f"{i+1}. {ans}" for i, ans in enumerate(answers))
+    ]
+    return send_file(
+        io.BytesIO("\n".join(lines).encode("utf-8")),
+        mimetype="text/plain",
+        as_attachment=True,
+        download_name=f"sample_answer_key_{count}q.txt"
+    )
+
+def parse_answer_key(raw_text):
+    """Parse raw answer key supporting comma-separated, space-separated, newlines,
+    and numbered lines like '1. A', '1: A', 'Q1 - A', 'Q1=A'."""
+    raw = (raw_text or "").strip()
+    if not raw:
+        return []
+    lines = [ln for ln in raw.splitlines() if not ln.strip().startswith("#")]
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\b(?:q\s*)?\d+[\.\:\-\)\=]\s*", " ", cleaned, flags=re.I)
+    tokens = [x.strip().upper() for x in re.split(r"[,\s]+", cleaned) if x.strip()]
+    return tokens
+
 @app.route("/templates/new", methods=["GET", "POST"])
 @login_required
 def new_template():
@@ -704,11 +769,18 @@ def scan():
             cfg = json.loads(template["config_json"])
             detected, diagnostics, method = scan_answers(path, cfg)
             key_raw = request.form.get("answer_key", "")
-            key_tokens = [x.strip().upper() for x in re.split(r"[,\s]+", key_raw) if x.strip()]
+            key_tokens = parse_answer_key(key_raw)
             if len(key_tokens) != cfg["question_count"]:
-                raise ValueError(f"Answer key must contain exactly {cfg['question_count']} answers separated by commas or spaces.")
-            if any(x not in cfg["options"] for x in key_tokens):
-                raise ValueError("Answer key contains an option not listed in this template.")
+                raise ValueError(
+                    f"Answer key contains {len(key_tokens)} answers, but this template requires exactly {cfg['question_count']}. "
+                    f"Tip: Use the '⚡ Fill Sample Key' button on the scan page to automatically generate a matching key."
+                )
+            invalid_opts = [x for x in key_tokens if x not in cfg["options"]]
+            if invalid_opts:
+                raise ValueError(
+                    f"Answer key contains invalid option '{invalid_opts[0]}'. "
+                    f"Allowed options for this template are: {', '.join(cfg['options'])}."
+                )
             key = {i+1: ans for i, ans in enumerate(key_tokens)}
             details = []
             correct = incorrect = unanswered = 0

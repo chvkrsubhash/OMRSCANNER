@@ -12,13 +12,17 @@
 <form method="post" enctype="multipart/form-data" class="panel scan-form">
   <div class="form-grid">
     <label>Test name
-      <input name="test_name" placeholder="e.g. Indian Polity Mock Test">
+      <input name="test_name" placeholder="e.g. APPSC Weekly Mock Test #1">
     </label>
     <label>OMR template
-      <select name="template_id" id="template_select" required onchange="updateDownloadLink()">
+      <select name="template_id" id="template_select" required onchange="handleTemplateChange()">
         <option value="">Choose template…</option>
         {% for t in templates %}
-          <option value="{{ t['id'] }}" {% if selected_template_id == t['id'] %}selected{% endif %}>
+          <option value="{{ t['id'] }}" 
+                  data-count="{{ t.cfg.question_count if t.cfg else 100 }}" 
+                  data-options="{{ t.cfg.options|join(',') if t.cfg and t.cfg.options else 'A,B,C,D' }}" 
+                  data-name="{{ t['name'] }}"
+                  {% if selected_template_id == t['id'] %}selected{% endif %}>
             {{ t['name'] }} ({{ t.cfg.question_count if t.cfg else 'Custom' }} Questions)
           </option>
         {% endfor %}
@@ -28,15 +32,18 @@
 
   <div id="template-download-box" class="template-download-box" style="display: none;">
     <div class="download-box-text">
-      <strong>Need a blank answer sheet for this test?</strong>
-      <span class="muted">Download the matching OMR sheet to print out or fill in digitally.</span>
+      <strong>Need the answer sheet or sample key for this template?</strong>
+      <span class="muted">Download printable PDF, fillable digital sheet, or answer key template file.</span>
     </div>
     <div class="download-box-actions">
       <a id="download-sheet-btn" class="button small secondary download-pill-btn" href="#" download>
-        📥 Download Printable Sheet (PDF)
+        📥 Download Sheet (PDF)
       </a>
       <a id="download-fillable-btn" class="button small ghost download-pill-btn" href="#" download>
-        ⚡ Download Fillable PDF
+        ⚡ Fillable PDF
+      </a>
+      <a id="download-key-btn" class="button small ghost download-pill-btn" href="#" download>
+        📄 Sample Key (.txt)
       </a>
     </div>
   </div>
@@ -48,13 +55,132 @@
     <span class="muted">Interactive or flattened PDF · maximum 20 MB</span>
   </label>
 
-  <label>Answer key 
-    <textarea name="answer_key" rows="4" required placeholder="A, C, B, D, A, ..."></textarea>
-    <small>Enter one answer per question, separated by commas or spaces. Must match the template question count.</small>
-  </label>
+  <!-- ANSWER KEY SECTION WITH TOOLBAR AND COUNTER -->
+  <div>
+    <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 6px; flex-wrap: wrap; gap: 8px;">
+      <label style="margin: 0; font-weight: 700; font-size: 13px;">
+        Answer key 
+      </label>
+      <div class="key-counter-bar" style="margin: 0;">
+        <span id="key-count-status" class="key-count-tag key-count-mismatch">
+          Answers: <strong id="key-count" style="margin: 0 3px;">0</strong> / <span id="target-count">100</span>
+        </span>
+      </div>
+    </div>
+
+    <!-- Quick action buttons -->
+    <div class="key-toolbar">
+      <button type="button" class="button small secondary" onclick="autoFillKey('abcd')" title="Auto-fill repeating A, B, C, D to match template question count">
+        ⚡ Fill Sample Key (A, B, C, D...)
+      </button>
+      <button type="button" class="button small ghost" onclick="autoFillKey('all_a')" title="Fill all answers with A">
+        ⚡ Fill All A's
+      </button>
+      <button type="button" class="button small ghost" onclick="autoFillKey('random')" title="Fill with random valid answers">
+        ⚡ Fill Random Key
+      </button>
+      <label class="button small ghost" style="display: inline-flex; cursor: pointer; margin: 0; font-weight: 700;" title="Upload answers from a .txt or .csv file">
+        📂 Load .txt file
+        <input type="file" id="key-file-input" accept=".txt,.csv" style="display: none;" onchange="loadKeyFromFile(this)">
+      </label>
+      <button type="button" class="button small ghost" onclick="downloadCurrentKey()" title="Download the text in this box as an answer key file">
+        📥 Save as .txt
+      </button>
+      <button type="button" class="button small ghost danger-hover" onclick="clearKey()" title="Clear textarea">
+        🧹 Clear
+      </button>
+    </div>
+
+    <textarea name="answer_key" id="answer_key_input" rows="5" required placeholder="A, B, C, D, A, B, C, D, ..." oninput="updateKeyCounter()"></textarea>
+    <small style="margin-top: 5px; color: var(--muted);">
+      Enter one answer per question separated by commas or spaces. Numbered formats like <code>1. A</code>, <code>1: A</code>, or <code>Q1: A</code> are also supported!
+    </small>
+  </div>
+
+  <!-- COLLAPSIBLE SAMPLE ANSWER KEYS READY TO COPY -->
+  <details class="sample-keys-panel">
+    <summary>📋 Click to view & copy pre-made sample answer keys (50Q, 60Q, 100Q, 125Q, 150Q, 200Q)</summary>
+    <p style="font-size: 12px; color: var(--muted); margin: 8px 0 12px;">
+      Click <strong>"⚡ Insert"</strong> to populate directly into the answer key box above, or <strong>"📋 Copy"</strong> to copy the raw text.
+    </p>
+
+    <div class="sample-keys-grid">
+      <!-- 50Q Card -->
+      <div class="sample-key-card">
+        <div class="sample-key-head">
+          <strong>50 Questions Key</strong>
+          <div>
+            <button type="button" class="button small primary" style="padding: 4px 8px; font-size: 11px;" onclick="insertSampleByKey('50q')">⚡ Insert</button>
+            <button type="button" class="button small ghost" style="padding: 4px 8px; font-size: 11px;" onclick="copySampleText('50q')">📋 Copy</button>
+          </div>
+        </div>
+        <div id="sample-text-50q" class="sample-key-box">A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B</div>
+      </div>
+
+      <!-- 60Q Card -->
+      <div class="sample-key-card">
+        <div class="sample-key-head">
+          <strong>60 Questions Key</strong>
+          <div>
+            <button type="button" class="button small primary" style="padding: 4px 8px; font-size: 11px;" onclick="insertSampleByKey('60q')">⚡ Insert</button>
+            <button type="button" class="button small ghost" style="padding: 4px 8px; font-size: 11px;" onclick="copySampleText('60q')">📋 Copy</button>
+          </div>
+        </div>
+        <div id="sample-text-60q" class="sample-key-box">A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D</div>
+      </div>
+
+      <!-- 100Q Card -->
+      <div class="sample-key-card">
+        <div class="sample-key-head">
+          <strong>100 Questions Key</strong>
+          <div>
+            <button type="button" class="button small primary" style="padding: 4px 8px; font-size: 11px;" onclick="insertSampleByKey('100q')">⚡ Insert</button>
+            <button type="button" class="button small ghost" style="padding: 4px 8px; font-size: 11px;" onclick="copySampleText('100q')">📋 Copy</button>
+          </div>
+        </div>
+        <div id="sample-text-100q" class="sample-key-box">A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D</div>
+      </div>
+
+      <!-- 125Q Card -->
+      <div class="sample-key-card">
+        <div class="sample-key-head">
+          <strong>125 Questions Key</strong>
+          <div>
+            <button type="button" class="button small primary" style="padding: 4px 8px; font-size: 11px;" onclick="insertSampleByKey('125q')">⚡ Insert</button>
+            <button type="button" class="button small ghost" style="padding: 4px 8px; font-size: 11px;" onclick="copySampleText('125q')">📋 Copy</button>
+          </div>
+        </div>
+        <div id="sample-text-125q" class="sample-key-box">A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A</div>
+      </div>
+
+      <!-- 150Q Card -->
+      <div class="sample-key-card">
+        <div class="sample-key-head">
+          <strong>150 Questions Key</strong>
+          <div>
+            <button type="button" class="button small primary" style="padding: 4px 8px; font-size: 11px;" onclick="insertSampleByKey('150q')">⚡ Insert</button>
+            <button type="button" class="button small ghost" style="padding: 4px 8px; font-size: 11px;" onclick="copySampleText('150q')">📋 Copy</button>
+          </div>
+        </div>
+        <div id="sample-text-150q" class="sample-key-box">A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B</div>
+      </div>
+
+      <!-- 200Q Card -->
+      <div class="sample-key-card">
+        <div class="sample-key-head">
+          <strong>200 Questions Key</strong>
+          <div>
+            <button type="button" class="button small primary" style="padding: 4px 8px; font-size: 11px;" onclick="insertSampleByKey('200q')">⚡ Insert</button>
+            <button type="button" class="button small ghost" style="padding: 4px 8px; font-size: 11px;" onclick="copySampleText('200q')">📋 Copy</button>
+          </div>
+        </div>
+        <div id="sample-text-200q" class="sample-key-box">A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D, A, B, C, D</div>
+      </div>
+    </div>
+  </details>
 
   <div class="notice">
-    <strong>Scoring:</strong> +1 for each correct answer. Incorrect and unanswered questions receive 0. Unclear visual detections are treated as unanswered until reviewed.
+    <strong>Scoring rule:</strong> +1 for each correct answer. Incorrect and unanswered questions receive 0. Unclear visual detections are treated as unanswered until reviewed.
   </div>
 
   <div class="form-actions">
@@ -64,20 +190,168 @@
 </form>
 
 <script>
+function getSelectedTemplateInfo() {
+  var sel = document.getElementById('template_select');
+  if (!sel || !sel.value) return { count: 100, options: ['A','B','C','D'], name: '' };
+  var opt = sel.options[sel.selectedIndex];
+  var count = parseInt(opt.getAttribute('data-count') || '100', 10);
+  var rawOpts = opt.getAttribute('data-options') || 'A,B,C,D';
+  var options = rawOpts.split(',').map(function(x) { return x.trim().toUpperCase(); }).filter(Boolean);
+  return {
+    id: sel.value,
+    count: count,
+    options: options.length ? options : ['A','B','C','D'],
+    name: opt.getAttribute('data-name') || ''
+  };
+}
+
+function handleTemplateChange() {
+  updateDownloadLink();
+  var info = getSelectedTemplateInfo();
+  document.getElementById('target-count').textContent = info.count;
+  updateKeyCounter();
+}
+
 function updateDownloadLink() {
   var sel = document.getElementById('template_select');
   var box = document.getElementById('template-download-box');
   var sheetBtn = document.getElementById('download-sheet-btn');
   var fillableBtn = document.getElementById('download-fillable-btn');
+  var keyBtn = document.getElementById('download-key-btn');
   if (sel && sel.value) {
     box.style.display = 'flex';
     sheetBtn.href = '/templates/' + sel.value + '/pdf';
     fillableBtn.href = '/templates/' + sel.value + '/pdf?interactive=1';
+    keyBtn.href = '/templates/' + sel.value + '/sample-key';
   } else if (box) {
     box.style.display = 'none';
   }
 }
-document.addEventListener('DOMContentLoaded', updateDownloadLink);
+
+function parseTokens(text) {
+  if (!text) return [];
+  // remove comment lines starting with #
+  var lines = text.split('\n').filter(function(l) { return !l.trim().startsWith('#'); });
+  var cleaned = lines.join(' ');
+  // remove numbered prefixes like 1. or 1: or Q1:
+  cleaned = cleaned.replace(/\b(?:q\s*)?\d+[\.\:\-\)\=]\s*/gi, ' ');
+  return cleaned.split(/[\s,]+/).map(function(t) { return t.trim().toUpperCase(); }).filter(Boolean);
+}
+
+function updateKeyCounter() {
+  var area = document.getElementById('answer_key_input');
+  var countSpan = document.getElementById('key-count');
+  var targetSpan = document.getElementById('target-count');
+  var statusTag = document.getElementById('key-count-status');
+  if (!area || !countSpan) return;
+
+  var info = getSelectedTemplateInfo();
+  targetSpan.textContent = info.count;
+
+  var tokens = parseTokens(area.value);
+  countSpan.textContent = tokens.length;
+
+  if (tokens.length === info.count) {
+    statusTag.className = 'key-count-tag key-count-match';
+    statusTag.title = 'Exact match for question count!';
+  } else {
+    statusTag.className = 'key-count-tag key-count-mismatch';
+    statusTag.title = 'Current count (' + tokens.length + ') does not match required (' + info.count + ')';
+  }
+}
+
+function autoFillKey(mode) {
+  var info = getSelectedTemplateInfo();
+  var count = info.count;
+  var opts = info.options;
+  var answers = [];
+
+  for (var i = 0; i < count; i++) {
+    if (mode === 'all_a') {
+      answers.push(opts[0]);
+    } else if (mode === 'random') {
+      answers.push(opts[Math.floor(Math.random() * opts.length)]);
+    } else {
+      // mode === 'abcd'
+      answers.push(opts[i % opts.length]);
+    }
+  }
+
+  var area = document.getElementById('answer_key_input');
+  area.value = answers.join(', ');
+  updateKeyCounter();
+}
+
+function clearKey() {
+  var area = document.getElementById('answer_key_input');
+  area.value = '';
+  updateKeyCounter();
+  area.focus();
+}
+
+function loadKeyFromFile(input) {
+  if (!input.files || !input.files[0]) return;
+  var file = input.files[0];
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var content = e.target.result;
+    var area = document.getElementById('answer_key_input');
+    area.value = content;
+    updateKeyCounter();
+  };
+  reader.readAsText(file);
+}
+
+function downloadCurrentKey() {
+  var area = document.getElementById('answer_key_input');
+  var text = area.value.trim();
+  if (!text) {
+    alert('Please enter or generate an answer key before downloading.');
+    return;
+  }
+  var info = getSelectedTemplateInfo();
+  var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = (info.name || 'answer_key').toLowerCase().replace(/[^a-z0-9]+/g, '_') + '_' + info.count + 'q.txt';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function insertSampleByKey(keyId) {
+  var el = document.getElementById('sample-text-' + keyId);
+  if (!el) return;
+  var text = el.textContent.trim();
+  var area = document.getElementById('answer_key_input');
+  area.value = text;
+  updateKeyCounter();
+  area.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function copySampleText(keyId) {
+  var el = document.getElementById('sample-text-' + keyId);
+  if (!el) return;
+  var text = el.textContent.trim();
+  navigator.clipboard.writeText(text).then(function() {
+    alert('Copied ' + keyId.toUpperCase() + ' answer key to clipboard!');
+  }).catch(function() {
+    // fallback
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+    alert('Copied ' + keyId.toUpperCase() + ' answer key to clipboard!');
+  });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  handleTemplateChange();
+});
 </script>
 
 {% else %}

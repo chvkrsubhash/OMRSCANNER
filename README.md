@@ -8,6 +8,13 @@ A Flask + SQLite web application for accounts, custom OMR template settings, PDF
 - **Pre-Calibrated Standard Answer Sheets**: Built-in 1-click loading for standard competitive exam formats (30Q, 50Q, 60Q, 100Q) mathematically calibrated with 100% scanning accuracy.
 - **Exam Header Format**: Includes registration corner marks, booklet/set code selector (A, B, C, D), candidate info fields (Name, Roll No., Class/Section, Date, Signature), and **Roll Number digit boxes with 0–9 bubble columns**.
 - **Download Template Sheets**: Instant generation and download of ready-to-print A4 OMR answer sheets (PDF), interactive digital fillable PDFs (with AcroForm bubbles), and JSON config backups.
+- **Answer Key Submission & Sample Keys**:
+  - **1-Click Auto-Fill**: Auto-generate alternating (`A, B, C, D...`), uniform (`All A's`), or random keys matching the template's exact question count.
+  - **Live Answer Counter**: Real-time counter badge validating entered answers against template question count.
+  - **Flexible Input Formats**: Accepts comma-separated (`A, B, C`), space-separated, newlines, and numbered lines (`1. A`, `1: A`, `Q1: A`).
+  - **File Load & Save**: Upload `.txt`/`.csv` key files or save the current key as a `.txt` file with 1 click.
+  - **Downloadable Key Templates**: Download pre-formatted `.txt` answer keys for each template (`/templates/<id>/sample-key`).
+  - **Pre-Made Sample Keys**: Quick-copy blocks for 50Q, 60Q, 100Q, 125Q, 150Q, and 200Q right on the scan page.
 - Upload PDF answer sheets (up to 20 MB, 100 pages).
 - Reads interactive AcroForm fields when field names include question numbers, e.g. `Q1_A`, `question_2`, or radio field values `A`, `B`, `C`, `D`.
 - If a PDF is flattened or uses visual marks, uses OpenCV sampling based on the saved custom bubble-grid coordinates.
