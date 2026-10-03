@@ -139,7 +139,7 @@ def normalize_config(form):
         raise ValueError("Minimum fill ratio must be lower than maximum.")
     return cfg
 
-def render_pdf_page(pdf_path, page_number):
+def render_pdf_page_rgb(pdf_path, page_number):
     doc = fitz.open(pdf_path)
     if page_number < 1 or page_number > len(doc):
         doc.close()
@@ -150,7 +150,18 @@ def render_pdf_page(pdf_path, page_number):
     if pix.n == 4:
         img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
     doc.close()
+    return img
+
+def render_pdf_page(pdf_path, page_number):
+    img = render_pdf_page_rgb(pdf_path, page_number)
     return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+def compute_ink_mask(rgb_img):
+    """Detect ink from blue ball/gel pen, black pen, pencil, or markers on white/light paper."""
+    gray = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
+    # Detect ink: black/dark ink or blue/colored ink vs white paper
+    return (gray < 165) | ((hsv[:, :, 1] > 50) & (gray < 225))
 
 def read_acroform_answers(pdf_path, question_count, options):
     """Read interactive PDF radio/check fields when their field names contain a question number.
@@ -174,7 +185,6 @@ def read_acroform_answers(pdf_path, question_count, options):
                 q = int(m.group(1))
                 if not 1 <= q <= question_count:
                     continue
-                # Some radio groups store the selected option in the field value; others encode it in the name.
                 candidates = [value.upper(), name.upper().split("_")[-1]]
                 selected = next((c for c in candidates if c in options), None)
                 if selected:
@@ -183,15 +193,75 @@ def read_acroform_answers(pdf_path, question_count, options):
         doc.close()
     return answers
 
+def scan_roll_number_visual(rgb_img):
+    """Visually detect the 6-digit roll number from the vertical 0-9 bubble columns."""
+    h, w, _ = rgb_img.shape
+    is_ink = compute_ink_mask(rgb_img)
+
+    NUM_DIGITS = 6
+    detected_digits = []
+
+    # Standard normalized coordinates for 6 roll number bubble columns:
+    # rn_x0 = 328.568 pt / 595.3 = 0.551936
+    # col_step = 21.5 pt / 595.3 = 0.036116
+    # col_half_w = (16.5 / 2.0) / 595.3 = 0.013858
+    # y0 = 125.0 pt / 841.9 = 0.148474
+    # y_step = 11.5 pt / 841.9 = 0.013659
+    # bub_r = 4.8 pt / 595.3 = 0.008063
+    bub_r_px = max(4, int(0.008063 * w))
+
+    for d in range(NUM_DIGITS):
+        col_cx_norm = 0.551936 + d * 0.036116 + 0.013858
+        cx = int(col_cx_norm * w)
+
+        digit_ratios = {}
+        for digit in range(10):
+            cy_norm = 0.148474 + digit * 0.013659
+            cy = int(cy_norm * h)
+
+            y1, y2 = max(0, cy - bub_r_px), min(h, cy + bub_r_px + 1)
+            x1, x2 = max(0, cx - bub_r_px), min(w, cx + bub_r_px + 1)
+            roi_ink = is_ink[y1:y2, x1:x2]
+            if roi_ink.size == 0:
+                digit_ratios[digit] = 0.0
+                continue
+
+            yy, xx = np.ogrid[:roi_ink.shape[0], :roi_ink.shape[1]]
+            mask = (xx - (roi_ink.shape[1]-1)/2)**2 + (yy - (roi_ink.shape[0]-1)/2)**2 <= (bub_r_px * 0.72)**2
+            vals = roi_ink[mask]
+            digit_ratios[digit] = float(np.mean(vals)) if vals.size else 0.0
+
+        ranked = sorted(digit_ratios.items(), key=lambda kv: kv[1], reverse=True)
+        top_digit, top_ratio = ranked[0]
+        second_ratio = ranked[1][1] if len(ranked) > 1 else 0.0
+
+        if top_ratio >= 0.45 or (top_ratio >= 0.25 and top_ratio - second_ratio >= 0.10):
+            detected_digits.append(str(top_digit))
+        else:
+            detected_digits.append("")
+
+    res = "".join(detected_digits).strip()
+    return res if len(res) >= 3 else ""
+
 def scan_answers(pdf_path, cfg):
     options = cfg["options"]
     count = cfg["question_count"]
+
     # Interactive AcroForm fields are more reliable than visual detection if usable fields exist.
     form_answers = read_acroform_answers(pdf_path, count, options)
     if len(form_answers) >= max(1, int(count * 0.5)):
         return form_answers, {q: {"method": "pdf_form", "confidence": 1.0, "ratios": {}} for q in form_answers}, "pdf_form"
 
     # Multi-page visual scanning support:
+    # Auto-calibrate if old/custom template coordinates deviate from standard pink sheet
+    if cfg.get("y_start", 0) < 0.33 or cfg.get("y_start", 0) > 0.45:
+        cfg["y_start"] = 0.3658
+        cfg["x_start"] = 0.1176
+        cfg["x_step"] = 0.0433
+        cfg["y_step"] = 0.0226
+        cfg["option_step"] = 0.0311
+        cfg["bubble_radius"] = 10
+
     qpc = max(1, cfg.get("questions_per_column", 25))
     max_cols = max(1, cfg.get("max_cols_per_page", 4))
     q_per_page = max_cols * qpc
@@ -203,12 +273,14 @@ def scan_answers(pdf_path, cfg):
     base_page = max(1, cfg.get("page_number", 1))
     page_cache = {}
 
-    def get_page_gray(p_num):
+    def get_page_data(p_num):
         if p_num not in page_cache:
             if p_num <= total_doc_pages:
-                page_cache[p_num] = render_pdf_page(pdf_path, p_num)
+                rgb = render_pdf_page_rgb(pdf_path, p_num)
+                is_ink = compute_ink_mask(rgb)
+                page_cache[p_num] = (rgb, is_ink)
             else:
-                page_cache[p_num] = None
+                page_cache[p_num] = (None, None)
         return page_cache[p_num]
 
     answers, diagnostics = {}, {}
@@ -220,8 +292,8 @@ def scan_answers(pdf_path, cfg):
         row = q_in_page % qpc
 
         target_p = base_page + page_offset
-        gray = get_page_gray(target_p)
-        if gray is None:
+        rgb, is_ink = get_page_data(target_p)
+        if is_ink is None:
             diagnostics[q] = {
                 "method": "visual",
                 "confidence": 0.0,
@@ -230,31 +302,35 @@ def scan_answers(pdf_path, cfg):
             }
             continue
 
-        h, w = gray.shape
+        h, w = is_ink.shape
         cx0 = int((cfg["x_start"] + col * cfg["x_step"] * (len(options) + 1)) * w)
         cy = int((cfg["y_start"] + row * cfg["y_step"]) * h)
         ratios = {}
         for oi, option in enumerate(options):
             cx = cx0 + int(oi * cfg["option_step"] * w)
-            r = cfg["bubble_radius"]
+            r = max(5, int(cfg.get("bubble_radius", 10)))
             x1, x2 = max(0, cx-r), min(w, cx+r+1)
             y1, y2 = max(0, cy-r), min(h, cy+r+1)
-            roi = gray[y1:y2, x1:x2]
-            if roi.size == 0:
+            roi_ink = is_ink[y1:y2, x1:x2]
+            if roi_ink.size == 0:
                 ratios[option] = 0.0
                 continue
-            # Exclude outer border by sampling a central disk.
-            yy, xx = np.ogrid[:roi.shape[0], :roi.shape[1]]
-            mask = (xx - (roi.shape[1]-1)/2)**2 + (yy - (roi.shape[0]-1)/2)**2 <= max(1, (r*0.62)**2)
-            vals = roi[mask]
-            ratios[option] = float(np.mean(vals < cfg["darkness_threshold"])) if vals.size else 0.0
+            # Sample central disk inside the bubble
+            yy, xx = np.ogrid[:roi_ink.shape[0], :roi_ink.shape[1]]
+            mask = (xx - (roi_ink.shape[1]-1)/2)**2 + (yy - (roi_ink.shape[0]-1)/2)**2 <= max(1, (r * 0.72)**2)
+            vals = roi_ink[mask]
+            ratios[option] = float(np.mean(vals)) if vals.size else 0.0
+
         ranked = sorted(ratios.items(), key=lambda kv: kv[1], reverse=True)
         top_opt, top_ratio = ranked[0]
         second_ratio = ranked[1][1] if len(ranked) > 1 else 0
-        marked = [opt for opt, ratio in ratios.items() if ratio >= cfg["min_fill_ratio"]]
-        if top_ratio >= cfg["max_fill_ratio"] or (top_ratio >= cfg["min_fill_ratio"] and top_ratio - second_ratio >= 0.08):
-            if len(marked) == 1 or (len(marked) > 1 and top_ratio - second_ratio >= 0.12):
+        marked = [opt for opt, ratio in ratios.items() if ratio >= 0.35]
+
+        # Robust detection: filled bubble clearly exceeds background threshold
+        if top_ratio >= 0.45 or (top_ratio >= 0.28 and top_ratio - second_ratio >= 0.12):
+            if len(marked) == 1 or (len(marked) > 1 and top_ratio - second_ratio >= 0.15):
                 answers[q] = top_opt
+
         diagnostics[q] = {
             "method": "visual",
             "confidence": round(max(0.0, min(1.0, top_ratio - second_ratio)), 3),
@@ -459,6 +535,16 @@ def extract_student_info(pdf_path, original_filename=""):
             except Exception:
                 pass
 
+    # Visual roll number bubble detection if not found in AcroForm widgets:
+    if not roll_no:
+        try:
+            rgb_p1 = render_pdf_page_rgb(pdf_path, 1)
+            visual_roll = scan_roll_number_visual(rgb_p1)
+            if visual_roll:
+                roll_no = visual_roll
+        except Exception:
+            pass
+
     clean_base = os.path.splitext(os.path.basename(original_filename or ""))[0]
     if not roll_no and clean_base:
         m_roll = re.search(r"(?:roll|ht|hall|id|reg)?[ _\-#]*(\d{4,12})", clean_base, re.I)
@@ -467,10 +553,13 @@ def extract_student_info(pdf_path, original_filename=""):
 
     if not name and clean_base:
         cand_str = re.sub(r"^(?:sample|test|omr|exam)[ _\-]*", "", clean_base, flags=re.I)
+        cand_str = re.sub(r"[ _\-]*(?:sheet|answersheet|response|omr)$", "", cand_str, flags=re.I)
         cand_str = cand_str.replace("_", " ").strip()
         if cand_str and not cand_str.isdigit():
             name = cand_str.title()
-        elif not name:
+        elif roll_no:
+            name = f"Candidate #{roll_no}"
+        else:
             name = clean_base
 
     return name.strip(), roll_no.strip()
@@ -485,6 +574,15 @@ def annotate_evaluated_omr(source_pdf_bytes, cfg, details, score_summary, studen
     - Multi-page pagination aware.
     """
     doc = fitz.open(stream=source_pdf_bytes, filetype="pdf")
+
+    # Auto-calibrate if old/custom template coordinates deviate from standard pink sheet
+    if cfg.get("y_start", 0) < 0.33 or cfg.get("y_start", 0) > 0.45:
+        cfg["y_start"] = 0.3658
+        cfg["x_start"] = 0.1176
+        cfg["x_step"] = 0.0433
+        cfg["y_step"] = 0.0226
+        cfg["option_step"] = 0.0311
+
     options = cfg.get("options", ["A", "B", "C", "D"])
     count = cfg.get("question_count", len(details))
     qpc = max(1, cfg.get("questions_per_column", 25))
@@ -517,6 +615,10 @@ def annotate_evaluated_omr(source_pdf_bytes, cfg, details, score_summary, studen
 
         p1.draw_rect(stamp_rect, color=theme_color, fill=theme_bg, width=1.2)
         p1.insert_text(fitz.Point(stamp_x0 + 8, stamp_y0 + 13), "OFFICIAL EVALUATION", fontsize=6.8, fontname="hebo", color=theme_color)
+
+        if student_info and student_info.get("roll_number"):
+            roll_disp = f"ROLL: {student_info['roll_number']}"
+            p1.insert_text(fitz.Point(stamp_x0 + stamp_w - 8 - len(roll_disp) * 4.3, stamp_y0 + 13), roll_disp, fontsize=6.8, fontname="hebo", color=NAVY)
 
         score_val = score_summary.get('score', 0)
         disp_score = int(score_val) if int(score_val) == score_val else round(score_val, 1)
