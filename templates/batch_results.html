@@ -1,0 +1,140 @@
+{% extends "base.html" %}{% block title %}Batch Evaluation Results{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">BATCH EVALUATION REPORT</div>
+    <h1>{{ test_name }}</h1>
+    <p class="muted">{{ template_name }} · Scored {{ total_students }} candidate sheet{{ 's' if total_students != 1 else '' }}</p>
+  </div>
+  <div class="head-actions">
+    <a class="button primary" href="{{ url_for('batch_excel', batch_id=batch_id) }}" download>
+      📊 Export Batch to Excel (.xlsx)
+    </a>
+    <a class="button secondary" href="{{ url_for('batch_all_pdfs', batch_id=batch_id) }}" download>
+      📦 Download All Evaluated PDFs (.zip)
+    </a>
+    <a class="button ghost" href="{{ url_for('scan') }}">
+      ＋ Scan More
+    </a>
+  </div>
+</div>
+
+<!-- CLASS PERFORMANCE KPI CARDS -->
+<div class="batch-stats-grid">
+  <div class="batch-stat-card">
+    <span>Total Candidates</span>
+    <strong>{{ total_students }}</strong>
+    <small>Answer sheets evaluated</small>
+  </div>
+  <div class="batch-stat-card">
+    <span>Class Average</span>
+    <strong class="good">{{ avg_score }}</strong>
+    <small>{{ avg_pct }}% overall accuracy</small>
+  </div>
+  <div class="batch-stat-card">
+    <span>Highest Score</span>
+    <strong style="color: var(--blue);">{{ highest_score|int if highest_score == highest_score|int else highest_score }}</strong>
+    <small>Out of {{ results[0]['question_count'] if results else 100 }} marks</small>
+  </div>
+  <div class="batch-stat-card">
+    <span>Pass Rate (≥40%)</span>
+    <strong class="{{ 'good' if pass_rate >= 50 else 'bad' }}">{{ pass_rate }}%</strong>
+    <small>{{ pass_count }} of {{ total_students }} candidates passed</small>
+  </div>
+</div>
+
+<!-- SEARCH & TABLE SECTION -->
+<div class="section-head">
+  <h2>Candidate Results & Rankings</h2>
+  <div style="max-width: 320px; width: 100%;">
+    <input type="text" id="student_search" placeholder="🔍 Search name, roll no, or file..." oninput="filterResultsTable()" style="padding: 8px 12px; font-size: 13px;">
+  </div>
+</div>
+
+<div class="panel table-wrap">
+  <table id="batch-results-table">
+    <thead>
+      <tr>
+        <th style="width: 50px; text-align: center;">Rank</th>
+        <th>Roll Number</th>
+        <th>Candidate / Filename</th>
+        <th style="text-align: center;">Score</th>
+        <th style="text-align: center;">Percentage</th>
+        <th style="text-align: center;">Correct (✓)</th>
+        <th style="text-align: center;">Wrong (✗)</th>
+        <th style="text-align: center;">Blank (—)</th>
+        <th style="text-align: center;">Status</th>
+        <th style="text-align: right;">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in results %}
+      {% set q_count = r['question_count'] or 1 %}
+      {% set pct = ((r['score'] / q_count) * 100)|round(1) %}
+      <tr class="result-row">
+        <td style="text-align: center; font-weight: 800; color: var(--muted);">#{{ loop.index }}</td>
+        <td>
+          <strong>{{ r['roll_number'] if r['roll_number'] else '—' }}</strong>
+        </td>
+        <td>
+          <strong>{{ r['candidate_name'] if r['candidate_name'] else r['filename'] }}</strong>
+          {% if r['candidate_name'] and r['filename'] != r['candidate_name'] %}
+            <small>{{ r['filename'] }}</small>
+          {% endif %}
+        </td>
+        <td style="text-align: center;">
+          <span class="score-pill">{{ r['score']|int if r['score'] == r['score']|int else r['score'] }} / {{ q_count }}</span>
+        </td>
+        <td style="text-align: center; font-weight: 700;">{{ pct }}%</td>
+        <td style="text-align: center; font-weight: 700; color: var(--green);">{{ r['correct_count'] }}</td>
+        <td style="text-align: center; font-weight: 700; color: var(--red);">{{ r['incorrect_count'] }}</td>
+        <td style="text-align: center; color: var(--muted);">{{ r['unanswered_count'] }}</td>
+        <td style="text-align: center;">
+          {% if pct >= 40.0 %}
+            <span class="status-pill status-pass">PASSED</span>
+          {% else %}
+            <span class="status-pill status-review">NEEDS REVIEW</span>
+          {% endif %}
+        </td>
+        <td style="text-align: right;">
+          <div class="action-link-group" style="justify-content: flex-end;">
+            <a class="btn-action-pill btn-action-pdf" href="{{ url_for('result_evaluated_pdf', result_id=r['id']) }}" download title="Download annotated PDF with green/red marks">
+              📥 Evaluated PDF
+            </a>
+            <a class="btn-action-pill btn-action-excel" href="{{ url_for('result_excel', result_id=r['id']) }}" download title="Export student scorecard to Excel (.xlsx)">
+              📊 Excel
+            </a>
+            <a class="btn-action-pill btn-action-view" href="{{ url_for('result_detail', result_id=r['id']) }}" title="View question-by-question review">
+              Details →
+            </a>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="form-actions" style="margin-top: 25px; justify-content: space-between;">
+  <a class="button secondary" href="{{ url_for('dashboard') }}">← Back to Dashboard</a>
+  <div style="display: flex; gap: 10px;">
+    <a class="button secondary" href="{{ url_for('batch_excel', batch_id=batch_id) }}" download>
+      📊 Export Excel (.xlsx)
+    </a>
+    <a class="button primary" href="{{ url_for('batch_all_pdfs', batch_id=batch_id) }}" download>
+      📦 Download All Evaluated PDFs (.zip)
+    </a>
+  </div>
+</div>
+
+<script>
+function filterResultsTable() {
+  const query = (document.getElementById("student_search").value || "").toLowerCase().trim();
+  const rows = document.querySelectorAll("#batch-results-table tbody tr");
+  rows.forEach(row => {
+    const text = row.innerText.toLowerCase();
+    row.style.display = text.includes(query) ? "" : "none";
+  });
+}
+</script>
+{% endblock %}

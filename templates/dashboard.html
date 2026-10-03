@@ -78,28 +78,51 @@
 
 <div class="section-head">
   <h2>Recent results</h2>
-  <span class="muted">Latest 10</span>
+  <div class="head-actions">
+    {% if results %}
+    <a class="button small secondary" href="{{ url_for('export_all_excel') }}" download title="Export all scored test results to an Excel spreadsheet">
+      📊 Export All to Excel (.xlsx)
+    </a>
+    {% endif %}
+  </div>
 </div>
 {% if results %}
 <div class="panel table-wrap">
   <table>
     <thead>
       <tr>
-        <th>Test</th>
+        <th>Candidate / Test</th>
+        <th>Roll No.</th>
         <th>Date</th>
         <th>Questions</th>
         <th>Score</th>
-        <th></th>
+        <th style="text-align: right;">Actions</th>
       </tr>
     </thead>
     <tbody>
       {% for r in results %}
       <tr>
-        <td><strong>{{ r['test_name'] }}</strong><small>{{ r['filename'] }}</small></td>
+        <td>
+          <strong>{{ r['candidate_name'] if r['candidate_name'] else r['test_name'] }}</strong>
+          <small>{{ r['test_name'] }} · {{ r['filename'] }}</small>
+        </td>
+        <td><strong>{{ r['roll_number'] if r['roll_number'] else '—' }}</strong></td>
         <td>{{ r['created_at'][:10] }}</td>
         <td>{{ r['question_count'] }}</td>
-        <td><span class="score-pill">{{ r['score']|int }} / {{ r['question_count'] }}</span></td>
-        <td><a href="{{ url_for('result_detail', result_id=r['id']) }}">View →</a></td>
+        <td><span class="score-pill">{{ r['score']|int if r['score'] == r['score']|int else r['score'] }} / {{ r['question_count'] }}</span></td>
+        <td style="text-align: right;">
+          <div class="action-link-group" style="justify-content: flex-end;">
+            <a class="btn-action-pill btn-action-pdf" href="{{ url_for('result_evaluated_pdf', result_id=r['id']) }}" download title="Download evaluated PDF with visual checkmarks and scores">
+              📥 PDF
+            </a>
+            <a class="btn-action-pill btn-action-excel" href="{{ url_for('result_excel', result_id=r['id']) }}" download title="Export student scorecard to Excel (.xlsx)">
+              📊 Excel
+            </a>
+            <a class="btn-action-pill btn-action-view" href="{{ url_for('result_detail', result_id=r['id']) }}">
+              View →
+            </a>
+          </div>
+        </td>
       </tr>
       {% endfor %}
     </tbody>

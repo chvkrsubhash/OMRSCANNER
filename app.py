@@ -8,6 +8,10 @@ import cv2
 import numpy as np
 from PIL import Image
 import io
+import zipfile
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "instance")
@@ -18,7 +22,7 @@ ALLOWED_EXTENSIONS = {"pdf"}
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "replace-this-with-a-long-random-secret")
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB for batch uploads
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -55,9 +59,21 @@ def init_db():
           unanswered_count INTEGER NOT NULL,
           score REAL NOT NULL,
           details_json TEXT NOT NULL,
-          created_at TEXT NOT NULL
+          created_at TEXT NOT NULL,
+          batch_id TEXT,
+          roll_number TEXT,
+          candidate_name TEXT,
+          stored_filename TEXT
         );
         """)
+        # Safe migration for existing tables
+        cols = [r[1] for r in con.execute("PRAGMA table_info(results)").fetchall()]
+        for col_name in ("batch_id", "roll_number", "candidate_name", "stored_filename"):
+            if col_name not in cols:
+                try:
+                    con.execute(f"ALTER TABLE results ADD COLUMN {col_name} TEXT")
+                except Exception:
+                    pass
 
 def hash_password(password, salt=None):
     salt = salt or secrets.token_hex(16)
@@ -400,6 +416,593 @@ def generate_omr_pdf(template_name, cfg, interactive=False):
         page.insert_text(fitz.Point(L + CW/2 - len(foot_text)*2.2, foot_y), foot_text, fontsize=7.2, fontname="helv", color=GRAY)
 
     return doc
+
+def extract_student_info(pdf_path, original_filename=""):
+    """Attempt to extract candidate name and roll number from interactive form fields,
+    roll number bubble widgets, or filename patterns."""
+    name, roll_no = "", ""
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        roll_digits = {}
+        for page in doc:
+            for w in page.widgets() or []:
+                fname = (w.field_name or "").strip()
+                fval = str(w.field_value or "").strip()
+                if not fval or fval.lower() in ("off", "false", "none", "0"):
+                    continue
+                if "candidatename" in fname.lower() or "candidate_name" in fname.lower():
+                    if not name:
+                        name = fval
+                elif "rollnotext" in fname.lower() or "roll_no" in fname.lower():
+                    if not roll_no:
+                        roll_no = fval
+                elif "rolldigit" in fname.lower():
+                    m_chk = re.search(r"rolldigit_p\d+_(\d+)_(\d+)", fname, re.I)
+                    if m_chk:
+                        d_col = int(m_chk.group(1))
+                        digit = m_chk.group(2)
+                        roll_digits[d_col] = digit
+                    else:
+                        m_txt = re.search(r"rolldigit_p\d+_(\d+)$", fname, re.I)
+                        if m_txt and fval:
+                            d_col = int(m_txt.group(1))
+                            roll_digits[d_col] = fval
+        if not roll_no and roll_digits:
+            roll_no = "".join([roll_digits[k] for k in sorted(roll_digits.keys())])
+    except Exception:
+        pass
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+    clean_base = os.path.splitext(os.path.basename(original_filename or ""))[0]
+    if not roll_no and clean_base:
+        m_roll = re.search(r"(?:roll|ht|hall|id|reg)?[ _\-#]*(\d{4,12})", clean_base, re.I)
+        if m_roll:
+            roll_no = m_roll.group(1)
+
+    if not name and clean_base:
+        cand_str = re.sub(r"^(?:sample|test|omr|exam)[ _\-]*", "", clean_base, flags=re.I)
+        cand_str = cand_str.replace("_", " ").strip()
+        if cand_str and not cand_str.isdigit():
+            name = cand_str.title()
+        elif not name:
+            name = clean_base
+
+    return name.strip(), roll_no.strip()
+
+def annotate_evaluated_omr(source_pdf_bytes, cfg, details, score_summary, student_info=None):
+    """Annotate evaluated OMR PDF with visual indicators and top scorecard stamp:
+    - Official Evaluation Card at top right.
+    - Vector green checkmark and green ring around correct bubbles.
+    - Vector red cross 'X' and red circle around wrong bubbles.
+    - Clear green ring and center dot indicating the correct answer on wrong questions.
+    - Amber ring and dash '—' on unanswered questions.
+    - Multi-page pagination aware.
+    """
+    doc = fitz.open(stream=source_pdf_bytes, filetype="pdf")
+    options = cfg.get("options", ["A", "B", "C", "D"])
+    count = cfg.get("question_count", len(details))
+    qpc = max(1, cfg.get("questions_per_column", 25))
+    max_cols = max(1, cfg.get("max_cols_per_page", 4))
+    q_per_page = max_cols * qpc
+
+    GREEN = (0.09, 0.64, 0.29)
+    GREEN_BG = (0.91, 0.98, 0.93)
+    RED = (0.86, 0.15, 0.15)
+    RED_BG = (0.99, 0.93, 0.93)
+    AMBER = (0.85, 0.53, 0.04)
+    GRAY_TEXT = (0.40, 0.43, 0.50)
+    NAVY = (0.12, 0.16, 0.23)
+
+    # 1. Top Evaluation Stamp Card on Page 1
+    if len(doc) > 0:
+        p1 = doc[0]
+        pw, ph = p1.rect.width, p1.rect.height
+
+        stamp_x0 = pw - 210.0
+        stamp_y0 = 34.0
+        stamp_w = 170.0
+        stamp_h = 44.0
+        stamp_rect = fitz.Rect(stamp_x0, stamp_y0, stamp_x0 + stamp_w, stamp_y0 + stamp_h)
+
+        pct = score_summary.get("pct", 0.0)
+        is_pass = pct >= 40.0
+        theme_color = GREEN if is_pass else RED
+        theme_bg = GREEN_BG if is_pass else RED_BG
+
+        p1.draw_rect(stamp_rect, color=theme_color, fill=theme_bg, width=1.2)
+        p1.insert_text(fitz.Point(stamp_x0 + 8, stamp_y0 + 13), "OFFICIAL EVALUATION", fontsize=6.8, fontname="hebo", color=theme_color)
+
+        score_val = score_summary.get('score', 0)
+        disp_score = int(score_val) if int(score_val) == score_val else round(score_val, 1)
+        score_str = f"{disp_score} / {score_summary.get('total', count)}"
+        p1.insert_text(fitz.Point(stamp_x0 + 8, stamp_y0 + 29), score_str, fontsize=13.0, fontname="hebo", color=theme_color)
+        p1.insert_text(fitz.Point(stamp_x0 + 95, stamp_y0 + 28), f"({pct:.1f}%)", fontsize=10.0, fontname="hebo", color=theme_color)
+
+        corr = score_summary.get("correct", 0)
+        inc = score_summary.get("incorrect", 0)
+        unans = score_summary.get("unanswered", 0)
+        stat_line = f"Correct: {corr}  |  Wrong: {inc}  |  Blank: {unans}"
+        p1.insert_text(fitz.Point(stamp_x0 + 8, stamp_y0 + 40), stat_line, fontsize=7.0, fontname="helv", color=NAVY)
+
+    # 2. Annotate each question
+    details_map = {d["question"]: d for d in details}
+    bub_r_pt = 5.2
+
+    for q in range(1, count + 1):
+        d = details_map.get(q)
+        if not d:
+            continue
+
+        page_idx = (q - 1) // q_per_page
+        if page_idx >= len(doc):
+            continue
+
+        page = doc[page_idx]
+        pw, ph = page.rect.width, page.rect.height
+
+        q_in_page = (q - 1) % q_per_page
+        col = q_in_page // qpc
+        row = q_in_page % qpc
+
+        cx0 = (cfg["x_start"] + col * cfg["x_step"] * (len(options) + 1)) * pw
+        cy = (cfg["y_start"] + row * cfg["y_step"]) * ph
+        opt_step = cfg["option_step"] * pw
+
+        marked = (d.get("marked") or "").strip().upper()
+        expected = (d.get("correct") or "").strip().upper()
+        status = d.get("status", "")
+
+        ix = cx0 - bub_r_pt - 21.0
+
+        if status == "Correct" and marked in options:
+            oi = options.index(marked)
+            cx = cx0 + oi * opt_step
+            page.draw_circle(fitz.Point(cx, cy), bub_r_pt + 2.0, color=GREEN, width=1.5)
+            page.draw_line(fitz.Point(ix - 3.5, cy - 0.5), fitz.Point(ix - 1.0, cy + 2.8), color=GREEN, width=1.4)
+            page.draw_line(fitz.Point(ix - 1.0, cy + 2.8), fitz.Point(ix + 3.8, cy - 3.5), color=GREEN, width=1.4)
+
+        elif status == "Incorrect":
+            if marked in options:
+                oi = options.index(marked)
+                cx = cx0 + oi * opt_step
+                page.draw_circle(fitz.Point(cx, cy), bub_r_pt + 2.0, color=RED, width=1.5)
+                cr = bub_r_pt + 0.5
+                page.draw_line(fitz.Point(cx - cr, cy - cr), fitz.Point(cx + cr, cy + cr), color=RED, width=1.2)
+                page.draw_line(fitz.Point(cx - cr, cy + cr), fitz.Point(cx + cr, cy - cr), color=RED, width=1.2)
+
+            if expected in options:
+                coi = options.index(expected)
+                ccx = cx0 + coi * opt_step
+                page.draw_circle(fitz.Point(ccx, cy), bub_r_pt + 2.0, color=GREEN, width=1.4)
+                page.draw_circle(fitz.Point(ccx, cy), 1.8, color=GREEN, fill=GREEN)
+
+            page.draw_line(fitz.Point(ix - 3.0, cy - 3.0), fitz.Point(ix + 3.0, cy + 3.0), color=RED, width=1.3)
+            page.draw_line(fitz.Point(ix - 3.0, cy + 3.0), fitz.Point(ix + 3.0, cy - 3.0), color=RED, width=1.3)
+
+        else: # Unanswered / blank
+            if expected in options:
+                coi = options.index(expected)
+                ccx = cx0 + coi * opt_step
+                page.draw_circle(fitz.Point(ccx, cy), bub_r_pt + 1.8, color=AMBER, width=1.1)
+            page.draw_line(fitz.Point(ix - 3.0, cy), fitz.Point(ix + 3.0, cy), color=GRAY_TEXT, width=1.2)
+
+    pdf_bytes = doc.tobytes()
+    doc.close()
+    return pdf_bytes
+
+def get_evaluated_pdf_for_result(result, upload_dir):
+    """Retrieve or re-render source PDF, annotate evaluation results, and return PDF bytes."""
+    payload = json.loads(result["details_json"])
+    details = payload.get("details", [])
+
+    cfg = None
+    template_name = payload.get("template", "OMR Template")
+    if result.get("template_id"):
+        with db() as con:
+            t = con.execute("SELECT * FROM templates WHERE id=?", (result["template_id"],)).fetchone()
+            if t:
+                try:
+                    cfg = json.loads(t["config_json"])
+                    template_name = t["name"]
+                except Exception:
+                    pass
+    if not cfg:
+        count = result["question_count"]
+        cfg = {
+            "question_count": count,
+            "options": ["A", "B", "C", "D"],
+            "page_number": 1,
+            "layout_mode": "grid",
+            "x_start": 0.1176, "y_start": 0.3658,
+            "x_step": 0.0433, "y_step": 0.0226,
+            "questions_per_column": 25, "option_step": 0.0311,
+            "bubble_radius": 10, "max_cols_per_page": 4,
+            "darkness_threshold": 90, "min_fill_ratio": 0.18, "max_fill_ratio": 0.70
+        }
+
+    stored_name = result.get("stored_filename") or result.get("filename")
+    source_bytes = None
+    if stored_name:
+        fpath = os.path.join(upload_dir, stored_name)
+        if os.path.exists(fpath):
+            try:
+                with open(fpath, "rb") as f:
+                    source_bytes = f.read()
+            except Exception:
+                pass
+
+    if not source_bytes:
+        doc = generate_omr_pdf(template_name, cfg, interactive=False)
+        source_bytes = doc.tobytes()
+        doc.close()
+
+    pct = round((result["correct_count"] / result["question_count"] * 100.0), 1) if result["question_count"] else 0.0
+    score_summary = {
+        "score": result["score"],
+        "total": result["question_count"],
+        "correct": result["correct_count"],
+        "incorrect": result["incorrect_count"],
+        "unanswered": result["unanswered_count"],
+        "pct": pct
+    }
+    student_info = {
+        "name": result.get("candidate_name") or "",
+        "roll_number": result.get("roll_number") or ""
+    }
+
+    return annotate_evaluated_omr(source_bytes, cfg, details, score_summary, student_info)
+
+def generate_batch_excel_workbook(results_list, test_name="OMR Evaluation", template_name="Standard Template"):
+    """Generate a multi-sheet formatted Excel workbook (.xlsx) with:
+    1. 'Results Summary' sheet: Rank, Roll Number, Student Name, Score, Percentage, Correct, Incorrect, Blank, Status.
+    2. 'Question Matrix' sheet: Student answers question-by-question with green/red conditional fills.
+    """
+    wb = openpyxl.Workbook()
+
+    ws1 = wb.active
+    ws1.title = "Results Summary"
+    ws1.views.sheetView[0].showGridLines = True
+
+    navy_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    indigo_fill = PatternFill(start_color="312E81", end_color="312E81", fill_type="solid")
+    pass_fill = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
+    fail_fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+    gray_sub_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+
+    white_bold = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    title_font = Font(name="Calibri", size=16, bold=True, color="0F172A")
+    subtitle_font = Font(name="Calibri", size=10, italic=True, color="64748B")
+    bold_font = Font(name="Calibri", size=11, bold=True)
+    regular_font = Font(name="Calibri", size=10)
+    pass_font = Font(name="Calibri", size=10, bold=True, color="166534")
+    fail_font = Font(name="Calibri", size=10, bold=True, color="991B1B")
+
+    thin_border = Border(
+        left=Side(style='thin', color='CBD5E1'),
+        right=Side(style='thin', color='CBD5E1'),
+        top=Side(style='thin', color='CBD5E1'),
+        bottom=Side(style='thin', color='CBD5E1')
+    )
+
+    ws1["A1"] = f"{test_name} — Evaluation Report"
+    ws1["A1"].font = title_font
+    ws1["A2"] = f"Template: {template_name}   |   Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}   |   Total Sheets: {len(results_list)}"
+    ws1["A2"].font = subtitle_font
+
+    headers = [
+        "Rank", "Roll No.", "Student / Filename",
+        "Score", "Max Marks", "Percentage",
+        "Correct (✓)", "Incorrect (✗)", "Blank (—)",
+        "Result Status", "Evaluated Date"
+    ]
+    header_row = 4
+    ws1.row_dimensions[header_row].height = 26
+    for c_idx, h in enumerate(headers, 1):
+        cell = ws1.cell(row=header_row, column=c_idx, value=h)
+        cell.fill = navy_fill
+        cell.font = white_bold
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = thin_border
+
+    sorted_results = sorted(results_list, key=lambda r: float(r["score"]), reverse=True)
+
+    row_start = 5
+    for rank, r in enumerate(sorted_results, 1):
+        r_num = row_start + rank - 1
+        ws1.row_dimensions[r_num].height = 20
+
+        q_count = r["question_count"] or 1
+        score_val = r["score"]
+        pct = (score_val / q_count) * 100.0 if q_count else 0.0
+        status_str = "PASSED" if pct >= 40.0 else "NEEDS REVIEW"
+
+        display_name = r.get("candidate_name") or r.get("filename") or f"Student #{rank}"
+        roll_val = r.get("roll_number") or "—"
+        created_str = (r.get("created_at") or "")[:19].replace("T", " ")
+
+        row_values = [
+            rank,
+            roll_val,
+            display_name,
+            score_val,
+            q_count,
+            pct / 100.0,
+            r["correct_count"],
+            r["incorrect_count"],
+            r["unanswered_count"],
+            status_str,
+            created_str
+        ]
+
+        for c_idx, val in enumerate(row_values, 1):
+            cell = ws1.cell(row=r_num, column=c_idx, value=val)
+            cell.font = regular_font
+            cell.border = thin_border
+
+            if c_idx in (1, 2, 4, 5, 7, 8, 9, 11):
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif c_idx == 3:
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            elif c_idx == 6:
+                cell.number_format = "0.0%"
+                cell.alignment = Alignment(horizontal="right", vertical="center")
+            elif c_idx == 10:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                if status_str == "PASSED":
+                    cell.fill = pass_fill
+                    cell.font = pass_font
+                else:
+                    cell.fill = fail_fill
+                    cell.font = fail_font
+
+    if sorted_results:
+        sum_row = row_start + len(sorted_results)
+        ws1.row_dimensions[sum_row].height = 22
+        ws1.cell(row=sum_row, column=1, value="").border = thin_border
+        ws1.cell(row=sum_row, column=2, value="").border = thin_border
+        cell_lbl = ws1.cell(row=sum_row, column=3, value="Class Average / Total")
+        cell_lbl.font = bold_font
+        cell_lbl.fill = gray_sub_fill
+        cell_lbl.alignment = Alignment(horizontal="right", vertical="center")
+        cell_lbl.border = thin_border
+
+        avg_score = sum(r["score"] for r in sorted_results) / len(sorted_results)
+        cell_avg = ws1.cell(row=sum_row, column=4, value=round(avg_score, 2))
+        cell_avg.font = bold_font
+        cell_avg.fill = gray_sub_fill
+        cell_avg.alignment = Alignment(horizontal="center", vertical="center")
+        cell_avg.border = thin_border
+
+        max_q = sorted_results[0]["question_count"]
+        cell_max = ws1.cell(row=sum_row, column=5, value=max_q)
+        cell_max.font = bold_font
+        cell_max.fill = gray_sub_fill
+        cell_max.alignment = Alignment(horizontal="center", vertical="center")
+        cell_max.border = thin_border
+
+        avg_pct = (avg_score / max_q) if max_q else 0.0
+        cell_avg_pct = ws1.cell(row=sum_row, column=6, value=avg_pct)
+        cell_avg_pct.font = bold_font
+        cell_avg_pct.fill = gray_sub_fill
+        cell_avg_pct.number_format = "0.0%"
+        cell_avg_pct.alignment = Alignment(horizontal="right", vertical="center")
+        cell_avg_pct.border = thin_border
+
+        for c in range(7, 12):
+            c_cell = ws1.cell(row=sum_row, column=c, value="")
+            c_cell.fill = gray_sub_fill
+            c_cell.border = thin_border
+
+    for col in ws1.columns:
+        max_len = max(len(str(cell.value or '')) for cell in col)
+        col_letter = get_column_letter(col[0].column)
+        ws1.column_dimensions[col_letter].width = max(max_len + 4, 11)
+
+    # Sheet 2: Item Analysis Matrix
+    if sorted_results and sorted_results[0].get("details_json"):
+        try:
+            first_payload = json.loads(sorted_results[0]["details_json"])
+            q_list = [d["question"] for d in first_payload.get("details", [])]
+            key_map = {d["question"]: d.get("correct", "") for d in first_payload.get("details", [])}
+
+            if q_list:
+                ws2 = wb.create_sheet(title="Item Analysis Matrix")
+                ws2.views.sheetView[0].showGridLines = True
+
+                ws2["A1"] = f"{test_name} — Question-by-Question Response Matrix"
+                ws2["A1"].font = title_font
+                ws2["A2"] = "Green = Correct answer | Red = Incorrect answer | Gray = Blank"
+                ws2["A2"].font = subtitle_font
+
+                h2 = ["Roll No.", "Candidate Name", "Total Score"] + [f"Q{q}" for q in q_list]
+                ws2.row_dimensions[4].height = 24
+                for c_idx, h in enumerate(h2, 1):
+                    cell = ws2.cell(row=4, column=c_idx, value=h)
+                    cell.fill = indigo_fill
+                    cell.font = white_bold
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                    cell.border = thin_border
+
+                ws2.row_dimensions[5].height = 20
+                ws2.cell(row=5, column=1, value="KEY").font = bold_font
+                ws2.cell(row=5, column=2, value="Official Answer Key").font = bold_font
+                ws2.cell(row=5, column=3, value=f"{len(q_list)} Qs").font = bold_font
+                for c_idx in (1, 2, 3):
+                    ws2.cell(row=5, column=c_idx).fill = gray_sub_fill
+                    ws2.cell(row=5, column=c_idx).border = thin_border
+                    ws2.cell(row=5, column=c_idx).alignment = Alignment(horizontal="center", vertical="center")
+                for qi, q in enumerate(q_list, 1):
+                    k_cell = ws2.cell(row=5, column=3 + qi, value=key_map.get(q, ""))
+                    k_cell.font = bold_font
+                    k_cell.fill = gray_sub_fill
+                    k_cell.alignment = Alignment(horizontal="center", vertical="center")
+                    k_cell.border = thin_border
+
+                for s_idx, r in enumerate(sorted_results, 1):
+                    r_num = 5 + s_idx
+                    ws2.row_dimensions[r_num].height = 19
+                    ws2.cell(row=r_num, column=1, value=r.get("roll_number") or "—").border = thin_border
+                    ws2.cell(row=r_num, column=2, value=r.get("candidate_name") or r.get("filename")).border = thin_border
+                    ws2.cell(row=r_num, column=3, value=r["score"]).border = thin_border
+                    for c in (1, 3):
+                        ws2.cell(row=r_num, column=c).alignment = Alignment(horizontal="center", vertical="center")
+
+                    payload = json.loads(r["details_json"])
+                    s_details = {d["question"]: d for d in payload.get("details", [])}
+
+                    for qi, q in enumerate(q_list, 1):
+                        qd = s_details.get(q, {})
+                        marked = qd.get("marked", "")
+                        status = qd.get("status", "")
+                        qcell = ws2.cell(row=r_num, column=3 + qi, value=marked or "—")
+                        qcell.alignment = Alignment(horizontal="center", vertical="center")
+                        qcell.font = regular_font
+                        qcell.border = thin_border
+
+                        if status == "Correct":
+                            qcell.fill = pass_fill
+                            qcell.font = pass_font
+                        elif status == "Incorrect":
+                            qcell.fill = fail_fill
+                            qcell.font = fail_font
+                        else:
+                            qcell.font = Font(name="Calibri", size=9, color="94A3B8")
+
+                ws2.column_dimensions["A"].width = 14
+                ws2.column_dimensions["B"].width = 24
+                ws2.column_dimensions["C"].width = 13
+                for qi in range(1, len(q_list) + 1):
+                    col_ltr = get_column_letter(3 + qi)
+                    ws2.column_dimensions[col_ltr].width = 6
+        except Exception:
+            pass
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+def generate_single_result_excel(result, details, template_name="Standard Template"):
+    """Generate a clean student scorecard Excel workbook."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Student Scorecard"
+    ws.views.sheetView[0].showGridLines = True
+
+    navy_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    pass_fill = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
+    fail_fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+    gray_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+
+    white_bold = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    title_font = Font(name="Calibri", size=16, bold=True, color="0F172A")
+    bold_font = Font(name="Calibri", size=11, bold=True)
+    regular_font = Font(name="Calibri", size=10)
+    pass_font = Font(name="Calibri", size=10, bold=True, color="166534")
+    fail_font = Font(name="Calibri", size=10, bold=True, color="991B1B")
+
+    thin_border = Border(
+        left=Side(style='thin', color='CBD5E1'),
+        right=Side(style='thin', color='CBD5E1'),
+        top=Side(style='thin', color='CBD5E1'),
+        bottom=Side(style='thin', color='CBD5E1')
+    )
+
+    ws["A1"] = f"{result['test_name']} — Candidate Scorecard"
+    ws["A1"].font = title_font
+
+    q_count = result["question_count"] or 1
+    score = result["score"]
+    pct = round((score / q_count) * 100.0, 1)
+
+    info_rows = [
+        ("Candidate Name", result.get("candidate_name") or result.get("filename") or "Candidate"),
+        ("Roll Number", result.get("roll_number") or "—"),
+        ("OMR Template", template_name),
+        ("Evaluation Date", (result.get("created_at") or "")[:19].replace("T", " ")),
+        ("Total Score", f"{score} / {q_count} ({pct}%)"),
+        ("Breakdown", f"Correct: {result['correct_count']}  |  Incorrect: {result['incorrect_count']}  |  Blank: {result['unanswered_count']}")
+    ]
+
+    for i, (k, v) in enumerate(info_rows, 3):
+        ws.cell(row=i, column=1, value=k).font = bold_font
+        ws.cell(row=i, column=1).fill = gray_fill
+        ws.cell(row=i, column=1).border = thin_border
+        cell_v = ws.cell(row=i, column=2, value=v)
+        cell_v.font = regular_font
+        cell_v.border = thin_border
+        if k == "Total Score":
+            cell_v.font = pass_font if pct >= 40 else fail_font
+            cell_v.fill = pass_fill if pct >= 40 else fail_fill
+
+    tbl_start = len(info_rows) + 5
+    headers = ["Question #", "Candidate Answer", "Answer Key", "Status", "Confidence", "Points"]
+    ws.row_dimensions[tbl_start].height = 24
+    for c_idx, h in enumerate(headers, 1):
+        cell = ws.cell(row=tbl_start, column=c_idx, value=h)
+        cell.fill = navy_fill
+        cell.font = white_bold
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = thin_border
+
+    for idx, d in enumerate(details, 1):
+        r_num = tbl_start + idx
+        ws.row_dimensions[r_num].height = 19
+        diag = d.get("diagnostics", {})
+        st = d.get("status", "")
+        pts = 1 if st == "Correct" else 0
+
+        row_vals = [
+            d["question"],
+            d["marked"] or "—",
+            d["correct"],
+            st,
+            diag.get("confidence", "—"),
+            pts
+        ]
+
+        for c_idx, val in enumerate(row_vals, 1):
+            cell = ws.cell(row=r_num, column=c_idx, value=val)
+            cell.font = regular_font
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            if c_idx == 4:
+                if st == "Correct":
+                    cell.fill = pass_fill
+                    cell.font = pass_font
+                elif st == "Incorrect":
+                    cell.fill = fail_fill
+                    cell.font = fail_font
+
+    for col in ws.columns:
+        max_len = max(len(str(cell.value or '')) for cell in col)
+        col_letter = get_column_letter(col[0].column)
+        ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+def generate_zip_evaluated_pdfs(results_list, app_upload_dir):
+    """Bundle evaluated PDFs for all students in results_list into a single in-memory ZIP."""
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in results_list:
+            pdf_bytes = get_evaluated_pdf_for_result(r, app_upload_dir)
+            if pdf_bytes:
+                roll = (r.get("roll_number") or "").strip()
+                name = (r.get("candidate_name") or r.get("filename") or f"student_{r['id']}").strip()
+                safe_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", f"{roll}_{name}".strip("_"))
+                zip_filename = f"{safe_name}_evaluated.pdf"
+                zf.writestr(zip_filename, pdf_bytes)
+    zip_buf.seek(0)
+    return zip_buf.getvalue()
 
 # Pre-calibrated seed templates calibrated to align exactly with the pink exam format
 # with 6 roll number boxes and 0-9 circle grid. Multi-page sheets paginate automatically.
@@ -752,23 +1355,15 @@ def scan():
         if not template:
             flash("Choose one of your saved templates.", "error")
             return render_template("scan.html", templates=templates, selected_template_id=selected_template_id)
-        upload = request.files.get("pdf")
-        if not upload or not upload.filename or not allowed_file(upload.filename):
-            flash("Please upload a PDF file.", "error")
+
+        uploads = request.files.getlist("pdf")
+        valid_uploads = [u for u in uploads if u and u.filename and allowed_file(u.filename)]
+        if not valid_uploads:
+            flash("Please upload at least one valid PDF file.", "error")
             return render_template("scan.html", templates=templates, selected_template_id=selected_template_id)
-        filename = secure_filename(upload.filename)
-        unique_name = f"{secrets.token_hex(8)}_{filename}"
-        path = os.path.join(UPLOAD_DIR, unique_name)
-        upload.save(path)
+
         try:
-            # Verify PDF and cap pages / malformed files.
-            doc = fitz.open(path)
-            if len(doc) > 100:
-                doc.close()
-                raise ValueError("PDF has too many pages (maximum 100).")
-            doc.close()
             cfg = json.loads(template["config_json"])
-            detected, diagnostics, method = scan_answers(path, cfg)
             key_raw = request.form.get("answer_key", "")
             key_tokens = parse_answer_key(key_raw)
             if len(key_tokens) != cfg["question_count"]:
@@ -782,40 +1377,189 @@ def scan():
                     f"Answer key contains invalid option '{invalid_opts[0]}'. "
                     f"Allowed options for this template are: {', '.join(cfg['options'])}."
                 )
+
             key = {i+1: ans for i, ans in enumerate(key_tokens)}
-            details = []
-            correct = incorrect = unanswered = 0
-            for q in range(1, cfg["question_count"]+1):
-                given = detected.get(q)
-                expected = key[q]
-                if not given:
-                    status = "Unanswered / review"
-                    unanswered += 1
-                elif given == expected:
-                    status = "Correct"
-                    correct += 1
-                else:
-                    status = "Incorrect"
-                    incorrect += 1
-                details.append({"question": q, "marked": given or "", "correct": expected, "status": status,
-                                "diagnostics": diagnostics.get(q, {})})
-            score = float(correct)  # requested scheme: +1 correct, no negative marking
+            batch_id = secrets.token_hex(8)
             test_name = request.form.get("test_name", "").strip() or "OMR Test"
-            with db() as con:
-                cur = con.execute("""INSERT INTO results(user_id,template_id,test_name,filename,question_count,correct_count,
-                  incorrect_count,unanswered_count,score,details_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                  (uid, template_id, test_name, filename, cfg["question_count"], correct, incorrect, unanswered,
-                   score, json.dumps({"details": details, "method": method, "template": template["name"]}),
-                   datetime.utcnow().isoformat(timespec="seconds")))
-                result_id = cur.lastrowid
-            return redirect(url_for("result_detail", result_id=result_id))
+            created_ids = []
+            errors = []
+
+            for upload in valid_uploads:
+                orig_filename = secure_filename(upload.filename)
+                unique_name = f"{secrets.token_hex(8)}_{orig_filename}"
+                path = os.path.join(UPLOAD_DIR, unique_name)
+                upload.save(path)
+
+                try:
+                    doc = fitz.open(path)
+                    if len(doc) > 100:
+                        doc.close()
+                        raise ValueError("PDF has too many pages (maximum 100).")
+                    doc.close()
+
+                    cand_name, roll_no = extract_student_info(path, orig_filename)
+                    detected, diagnostics, method = scan_answers(path, cfg)
+
+                    details = []
+                    correct = incorrect = unanswered = 0
+                    for q in range(1, cfg["question_count"]+1):
+                        given = detected.get(q)
+                        expected = key[q]
+                        if not given:
+                            status = "Unanswered / review"
+                            unanswered += 1
+                        elif given == expected:
+                            status = "Correct"
+                            correct += 1
+                        else:
+                            status = "Incorrect"
+                            incorrect += 1
+                        details.append({
+                            "question": q,
+                            "marked": given or "",
+                            "correct": expected,
+                            "status": status,
+                            "diagnostics": diagnostics.get(q, {})
+                        })
+
+                    score = float(correct)
+                    with db() as con:
+                        cur = con.execute("""
+                            INSERT INTO results(
+                                user_id, template_id, test_name, filename, question_count,
+                                correct_count, incorrect_count, unanswered_count, score,
+                                details_json, created_at, batch_id, roll_number, candidate_name, stored_filename
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """, (
+                            uid, template_id, test_name, orig_filename, cfg["question_count"],
+                            correct, incorrect, unanswered, score,
+                            json.dumps({
+                                "details": details,
+                                "method": method,
+                                "template": template["name"],
+                                "key": key_tokens
+                            }),
+                            datetime.utcnow().isoformat(timespec="seconds"),
+                            batch_id, roll_no, cand_name, unique_name
+                        ))
+                        created_ids.append(cur.lastrowid)
+                except Exception as file_err:
+                    errors.append(f"{orig_filename}: {file_err}")
+
+            if not created_ids:
+                flash(f"Could not score uploaded files: {'; '.join(errors)}", "error")
+                return render_template("scan.html", templates=templates, selected_template_id=selected_template_id)
+
+            if errors:
+                flash(f"Scored {len(created_ids)} file(s). Notice on failed files: {'; '.join(errors)}", "warning")
+            else:
+                flash(f"Successfully evaluated {len(created_ids)} answer sheet(s)!", "success")
+
+            if len(created_ids) > 1:
+                return redirect(url_for("batch_results", batch_id=batch_id))
+            else:
+                return redirect(url_for("result_detail", result_id=created_ids[0]))
+
         except Exception as e:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            flash(f"Could not score this PDF: {e}", "error")
+            flash(f"Evaluation error: {e}", "error")
+
     return render_template("scan.html", templates=templates, selected_template_id=selected_template_id)
+
+@app.route("/batch/<batch_id>")
+@login_required
+def batch_results(batch_id):
+    uid = session["user_id"]
+    with db() as con:
+        results = [dict(r) for r in con.execute(
+            "SELECT * FROM results WHERE batch_id=? AND user_id=? ORDER BY score DESC, id ASC",
+            (batch_id, uid)
+        ).fetchall()]
+    if not results:
+        abort(404)
+
+    test_name = results[0]["test_name"]
+    template_name = "OMR Template"
+    if results[0].get("template_id"):
+        with db() as con:
+            t = con.execute("SELECT name FROM templates WHERE id=?", (results[0]["template_id"],)).fetchone()
+            if t:
+                template_name = t["name"]
+
+    total_students = len(results)
+    total_score = sum(r["score"] for r in results)
+    avg_score = round(total_score / total_students, 1) if total_students else 0
+    highest_score = max(r["score"] for r in results) if results else 0
+    lowest_score = min(r["score"] for r in results) if results else 0
+    q_count = results[0]["question_count"] or 1
+    avg_pct = round((avg_score / q_count) * 100, 1) if q_count else 0
+    pass_count = sum(1 for r in results if (r["score"] / q_count * 100) >= 40.0)
+    pass_rate = round((pass_count / total_students) * 100, 1) if total_students else 0
+
+    return render_template(
+        "batch_results.html",
+        batch_id=batch_id,
+        results=results,
+        test_name=test_name,
+        template_name=template_name,
+        total_students=total_students,
+        avg_score=avg_score,
+        avg_pct=avg_pct,
+        highest_score=highest_score,
+        lowest_score=lowest_score,
+        pass_rate=pass_rate,
+        pass_count=pass_count
+    )
+
+@app.route("/batch/<batch_id>/excel")
+@login_required
+def batch_excel(batch_id):
+    uid = session["user_id"]
+    with db() as con:
+        results = [dict(r) for r in con.execute(
+            "SELECT * FROM results WHERE batch_id=? AND user_id=? ORDER BY score DESC, id ASC",
+            (batch_id, uid)
+        ).fetchall()]
+    if not results:
+        abort(404)
+
+    test_name = results[0]["test_name"]
+    template_name = "OMR Template"
+    if results[0].get("template_id"):
+        with db() as con:
+            t = con.execute("SELECT name FROM templates WHERE id=?", (results[0]["template_id"],)).fetchone()
+            if t:
+                template_name = t["name"]
+
+    excel_bytes = generate_batch_excel_workbook(results, test_name, template_name)
+    safe_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", test_name.strip()).strip("_")
+    return send_file(
+        io.BytesIO(excel_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"{safe_name}_batch_results.xlsx"
+    )
+
+@app.route("/batch/<batch_id>/download-all-pdfs")
+@login_required
+def batch_all_pdfs(batch_id):
+    uid = session["user_id"]
+    with db() as con:
+        results = [dict(r) for r in con.execute(
+            "SELECT * FROM results WHERE batch_id=? AND user_id=?",
+            (batch_id, uid)
+        ).fetchall()]
+    if not results:
+        abort(404)
+
+    test_name = results[0]["test_name"]
+    zip_bytes = generate_zip_evaluated_pdfs(results, UPLOAD_DIR)
+    safe_name = re.sub(r"[^a-zA-Z0-9_\-]+", "_", test_name.strip()).strip("_")
+    return send_file(
+        io.BytesIO(zip_bytes),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=f"{safe_name}_all_evaluated_pdfs.zip"
+    )
 
 @app.route("/results/<int:result_id>")
 @login_required
@@ -828,6 +1572,49 @@ def result_detail(result_id):
     pct = round((result["correct_count"] / result["question_count"] * 100), 1) if result["question_count"] else 0
     return render_template("result.html", result=result, details=payload["details"], method=payload.get("method"), pct=pct,
                            template_name=payload.get("template", "Template"))
+
+@app.route("/results/<int:result_id>/evaluated-pdf")
+@login_required
+def result_evaluated_pdf(result_id):
+    uid = session["user_id"]
+    with db() as con:
+        r = con.execute("SELECT * FROM results WHERE id=? AND user_id=?", (result_id, uid)).fetchone()
+    if not r:
+        abort(404)
+
+    pdf_bytes = get_evaluated_pdf_for_result(dict(r), UPLOAD_DIR)
+    roll = (r["roll_number"] or "").strip()
+    name = (r["candidate_name"] or r["filename"] or f"student_{r['id']}").strip()
+    safe_label = re.sub(r"[^a-zA-Z0-9_\-]+", "_", f"{roll}_{name}".strip("_"))
+    return send_file(
+        io.BytesIO(pdf_bytes),
+        mimetype="application/pdf",
+        as_attachment=True,
+        download_name=f"{safe_label}_evaluated.pdf"
+    )
+
+@app.route("/results/<int:result_id>/excel")
+@login_required
+def result_excel(result_id):
+    uid = session["user_id"]
+    with db() as con:
+        r = con.execute("SELECT * FROM results WHERE id=? AND user_id=?", (result_id, uid)).fetchone()
+    if not r:
+        abort(404)
+
+    payload = json.loads(r["details_json"])
+    template_name = payload.get("template", "OMR Template")
+    excel_bytes = generate_single_result_excel(dict(r), payload.get("details", []), template_name)
+
+    roll = (r["roll_number"] or "").strip()
+    name = (r["candidate_name"] or r["filename"] or f"student_{r['id']}").strip()
+    safe_label = re.sub(r"[^a-zA-Z0-9_\-]+", "_", f"{roll}_{name}".strip("_"))
+    return send_file(
+        io.BytesIO(excel_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"{safe_label}_scorecard.xlsx"
+    )
 
 @app.route("/results/<int:result_id>/csv")
 @login_required
@@ -847,6 +1634,27 @@ def result_csv(result_id):
     mem = io.BytesIO(output.getvalue().encode("utf-8-sig"))
     mem.seek(0)
     return send_file(mem, mimetype="text/csv", as_attachment=True, download_name=f"omr_result_{result_id}.csv")
+
+@app.route("/results/export-all-excel")
+@login_required
+def export_all_excel():
+    uid = session["user_id"]
+    with db() as con:
+        results = [dict(r) for r in con.execute(
+            "SELECT * FROM results WHERE user_id=? ORDER BY id DESC",
+            (uid,)
+        ).fetchall()]
+    if not results:
+        flash("No results to export yet.", "info")
+        return redirect(url_for("dashboard"))
+
+    excel_bytes = generate_batch_excel_workbook(results, "All Scored Tests", "All Templates")
+    return send_file(
+        io.BytesIO(excel_bytes),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name="all_omr_results.xlsx"
+    )
 
 @app.route("/results/<int:result_id>/delete", methods=["POST"])
 @login_required

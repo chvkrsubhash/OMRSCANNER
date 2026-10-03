@@ -48,11 +48,15 @@
     </div>
   </div>
 
-  <label class="upload-zone">
-    <input type="file" name="pdf" accept="application/pdf,.pdf" required>
-    <span class="upload-icon">↑</span>
-    <strong>Choose your PDF</strong>
-    <span class="muted">Interactive or flattened PDF · maximum 20 MB</span>
+  <label class="upload-zone" id="upload-zone-label">
+    <input type="file" name="pdf" id="pdf_upload_input" accept="application/pdf,.pdf" multiple required onchange="handleFileSelection(this)">
+    <span class="upload-icon">📁</span>
+    <strong id="upload-main-text">Choose PDF File(s)</strong>
+    <span id="upload-sub-text" class="muted">Select one or multiple student PDFs for batch scoring · Interactive or flattened · up to 20 MB each</span>
+    <div id="file-selection-badge" class="file-selection-badge" style="display: none;">
+      <span id="file-count-text">0 files selected</span>
+      <div id="file-names-list" class="file-names-list"></div>
+    </div>
   </label>
 
   <!-- ANSWER KEY SECTION WITH TOOLBAR AND COUNTER -->
@@ -347,6 +351,41 @@ function copySampleText(keyId) {
     document.body.removeChild(ta);
     alert('Copied ' + keyId.toUpperCase() + ' answer key to clipboard!');
   });
+}
+
+function handleFileSelection(input) {
+  var badge = document.getElementById("file-selection-badge");
+  var countText = document.getElementById("file-count-text");
+  var namesList = document.getElementById("file-names-list");
+  var mainText = document.getElementById("upload-main-text");
+  var subText = document.getElementById("upload-sub-text");
+
+  if (!input.files || input.files.length === 0) {
+    if (badge) badge.style.display = "none";
+    if (mainText) mainText.textContent = "Choose PDF File(s)";
+    if (subText) subText.textContent = "Select one or multiple student PDFs for batch scoring · Interactive or flattened · up to 20 MB each";
+    return;
+  }
+
+  var count = input.files.length;
+  if (badge) badge.style.display = "block";
+  if (count === 1) {
+    if (mainText) mainText.textContent = "1 PDF Selected";
+    if (countText) countText.innerHTML = "<strong>1 file ready to scan:</strong> " + input.files[0].name;
+    if (namesList) namesList.innerHTML = "";
+  } else {
+    if (mainText) mainText.textContent = count + " PDFs Selected for Batch Scoring";
+    if (countText) countText.innerHTML = "<strong>" + count + " files ready for batch evaluation</strong>";
+    var html = "";
+    var displayCount = Math.min(count, 8);
+    for (var i = 0; i < displayCount; i++) {
+      html += '<span class="file-name-pill">📄 ' + input.files[i].name + '</span>';
+    }
+    if (count > 8) {
+      html += '<span class="file-name-pill muted">+' + (count - 8) + ' more files</span>';
+    }
+    if (namesList) namesList.innerHTML = html;
+  }
 }
 
 document.addEventListener('DOMContentLoaded', function() {
