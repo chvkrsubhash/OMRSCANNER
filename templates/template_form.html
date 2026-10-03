@@ -1,0 +1,28 @@
+{% extends "base.html" %}{% block title %}Create template{% endblock %}
+{% block content %}
+<div class="page-head"><div><div class="eyebrow">TEMPLATE BUILDER</div><h1>Configure your OMR sheet</h1><p class="muted">Use form-field reading where available; visual detection needs measured bubble coordinates.</p></div></div>
+<form method="post" class="panel builder-form">
+<div class="form-section"><h2>Template basics</h2><div class="form-grid">
+<label>Template name<input name="name" required placeholder="e.g. APPSC 100Q OMR"></label>
+<label>Question count<input type="number" name="question_count" min="1" max="500" value="100" required></label>
+<label>Answer options<input name="options" value="A,B,C,D" required><small>Comma-separated, 2–8 unique options.</small></label>
+<label>PDF page number<input type="number" name="page_number" min="1" value="1" required><small>Page containing the answer grid.</small></label>
+</div></div>
+<div class="form-section"><h2>Visual bubble grid</h2><p class="muted">Coordinates are normalized from 0 to 1, measured from the top-left of the rendered page. These defaults are examples, not universal values.</p>
+<div class="form-grid three">
+<label>First bubble X<input type="number" name="x_start" step="0.001" min="0" max="1" value="0.136" required></label>
+<label>First bubble Y<input type="number" name="y_start" step="0.001" min="0" max="1" value="0.238" required></label>
+<label>Vertical row step<input type="number" name="y_step" step="0.001" min="0" max="1" value="0.0248" required></label>
+<label>Question-column step<input type="number" name="x_step" step="0.001" min="0" max="1" value="0.0433" required></label>
+<label>Option bubble step<input type="number" name="option_step" step="0.001" min="0" max="1" value="0.0415" required></label>
+<label>Questions per column<input type="number" name="questions_per_column" min="1" value="25" required></label>
+<label>Bubble radius (pixels)<input type="number" name="bubble_radius" min="2" max="80" value="8" required></label>
+<label>Darkness threshold<input type="number" name="darkness_threshold" min="0" max="255" value="90" required><small>Lower values detect only darker pixels.</small></label>
+<label>Minimum fill ratio<input type="number" name="min_fill_ratio" step="0.01" min="0" max="1" value="0.18" required></label>
+<label>Maximum fill ratio<input type="number" name="max_fill_ratio" step="0.01" min="0" max="1" value="0.70" required></label>
+</div></div>
+<div class="notice"><strong>Calibration tip:</strong> For a flattened PDF, render the page and measure the center of option A for question 1, then measure row and option spacing. The scanner renders at 2×, so radius is in rendered-image pixels. Interactive AcroForm fields are read separately when recognizable.</div>
+<div class="notice" style="background: #eef5fc; border-color: #cbe0f8; color: #1e4578;"><strong>Instant Sheet Generation:</strong> As soon as you save this template, you can download a generated, ready-to-print OMR sheet PDF or an interactive fillable PDF directly aligned to these coordinates.</div>
+<div class="form-actions"><a class="button secondary" href="{{ url_for('dashboard') }}">Cancel</a><button class="button primary" type="submit">Save template</button></div>
+</form>
+{% endblock %}

@@ -1,0 +1,97 @@
+{% extends "base.html" %}{% block title %}Scan PDF{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">SCAN & SCORE</div>
+    <h1>Score an answer sheet</h1>
+    <p class="muted">Upload a PDF, select the matching template, and provide the answer key.</p>
+  </div>
+</div>
+
+{% if templates %}
+<form method="post" enctype="multipart/form-data" class="panel scan-form">
+  <div class="form-grid">
+    <label>Test name
+      <input name="test_name" placeholder="e.g. Indian Polity Mock Test">
+    </label>
+    <label>OMR template
+      <select name="template_id" id="template_select" required onchange="updateDownloadLink()">
+        <option value="">Choose template…</option>
+        {% for t in templates %}
+          <option value="{{ t['id'] }}" {% if selected_template_id == t['id'] %}selected{% endif %}>
+            {{ t['name'] }} ({{ t.cfg.question_count if t.cfg else 'Custom' }} Questions)
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+
+  <div id="template-download-box" class="template-download-box" style="display: none;">
+    <div class="download-box-text">
+      <strong>Need a blank answer sheet for this test?</strong>
+      <span class="muted">Download the matching OMR sheet to print out or fill in digitally.</span>
+    </div>
+    <div class="download-box-actions">
+      <a id="download-sheet-btn" class="button small secondary download-pill-btn" href="#" download>
+        📥 Download Printable Sheet (PDF)
+      </a>
+      <a id="download-fillable-btn" class="button small ghost download-pill-btn" href="#" download>
+        ⚡ Download Fillable PDF
+      </a>
+    </div>
+  </div>
+
+  <label class="upload-zone">
+    <input type="file" name="pdf" accept="application/pdf,.pdf" required>
+    <span class="upload-icon">↑</span>
+    <strong>Choose your PDF</strong>
+    <span class="muted">Interactive or flattened PDF · maximum 20 MB</span>
+  </label>
+
+  <label>Answer key 
+    <textarea name="answer_key" rows="4" required placeholder="A, C, B, D, A, ..."></textarea>
+    <small>Enter one answer per question, separated by commas or spaces. Must match the template question count.</small>
+  </label>
+
+  <div class="notice">
+    <strong>Scoring:</strong> +1 for each correct answer. Incorrect and unanswered questions receive 0. Unclear visual detections are treated as unanswered until reviewed.
+  </div>
+
+  <div class="form-actions">
+    <a class="button secondary" href="{{ url_for('dashboard') }}">Cancel</a>
+    <button class="button primary" type="submit">Scan and score →</button>
+  </div>
+</form>
+
+<script>
+function updateDownloadLink() {
+  var sel = document.getElementById('template_select');
+  var box = document.getElementById('template-download-box');
+  var sheetBtn = document.getElementById('download-sheet-btn');
+  var fillableBtn = document.getElementById('download-fillable-btn');
+  if (sel && sel.value) {
+    box.style.display = 'flex';
+    sheetBtn.href = '/templates/' + sel.value + '/pdf';
+    fillableBtn.href = '/templates/' + sel.value + '/pdf?interactive=1';
+  } else if (box) {
+    box.style.display = 'none';
+  }
+}
+document.addEventListener('DOMContentLoaded', updateDownloadLink);
+</script>
+
+{% else %}
+<div class="empty panel">
+  <div class="empty-icon">▦</div>
+  <h3>No template configured yet</h3>
+  <p>The app needs an OMR template to know question count and bubble positions before scoring a sheet.</p>
+  <div class="hero-actions" style="justify-content: center; margin-top: 15px; gap: 10px; flex-wrap: wrap;">
+    <form method="post" action="{{ url_for('seed_templates') }}" style="display:inline;">
+      <button class="button primary" type="submit">⚡ Load Standard Templates (30Q, 50Q, 60Q, 100Q)</button>
+    </form>
+    <a class="button secondary" href="{{ url_for('new_template') }}">Create custom template</a>
+    <a class="button ghost" href="{{ url_for('sample_pdf', count=60) }}">Download Sample 60Q Sheet</a>
+  </div>
+</div>
+{% endif %}
+{% endblock %}

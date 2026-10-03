@@ -1,0 +1,113 @@
+{% extends "base.html" %}{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">YOUR WORKSPACE</div>
+    <h1>Good to see you, {{ session.get('username') }}.</h1>
+    <p class="muted">Set up a template once, download the matching OMR sheet to print or fill digitally, then scan and score.</p>
+  </div>
+  <a class="button primary" href="{{ url_for('scan') }}">＋ Scan a PDF</a>
+</div>
+
+<div class="stats">
+  <div class="stat"><span>Saved results</span><strong>{{ total }}</strong></div>
+  <div class="stat"><span>OMR templates</span><strong>{{ templates|length }}</strong></div>
+  <div class="stat"><span>Scoring rule</span><strong>+1 / 0</strong></div>
+</div>
+
+<div class="section-head">
+  <h2>Your templates</h2>
+  <div class="head-actions">
+    <form method="post" action="{{ url_for('seed_templates') }}" style="display:inline;">
+      <button class="button small secondary" type="submit" title="Install pre-calibrated standard answer sheets (30Q, 50Q, 60Q, 100Q)">⚡ Load Standard Templates</button>
+    </form>
+    <a class="button small ghost" href="{{ url_for('sample_pdf', count=60) }}" title="Download ready-to-print 60Q practice sheet">Sample 60Q Sheet ↓</a>
+    <a class="button small primary" href="{{ url_for('new_template') }}">Create template →</a>
+  </div>
+</div>
+
+{% if templates %}
+<div class="template-grid">
+  {% for t in templates %}
+  <article class="panel template-card">
+    <div class="template-card-header">
+      <div class="template-symbol">▦</div>
+      <span class="badge">{{ t.cfg.question_count if t.cfg else 'Custom' }} Qs</span>
+    </div>
+    <h3>{{ t['name'] }}</h3>
+    <p class="muted">Options: {{ t.cfg.options|join(', ') if t.cfg and t.cfg.options else 'A, B, C, D' }} · {{ t.cfg.questions_per_column if t.cfg else '25' }} per col</p>
+    
+    <div class="template-download-pane">
+      <span class="download-label">Download Template / Sheet:</span>
+      <div class="download-btn-row">
+        <a class="button small secondary download-pill-btn" href="{{ url_for('template_pdf', template_id=t['id']) }}" download title="Download clean printable A4 PDF sheet">
+          📥 Printable PDF
+        </a>
+        <a class="button small ghost download-pill-btn" href="{{ url_for('template_pdf', template_id=t['id'], interactive=1) }}" download title="Download digital fillable PDF with interactive radio bubbles">
+          ⚡ Fillable PDF
+        </a>
+        <a class="button small ghost download-pill-btn" href="{{ url_for('template_json', template_id=t['id']) }}" download title="Download template JSON configuration">
+          { } JSON
+        </a>
+      </div>
+    </div>
+
+    <div class="template-actions">
+      <a class="button small primary" href="{{ url_for('scan', template_id=t['id']) }}">Scan with this →</a>
+      <form method="post" action="{{ url_for('delete_template', template_id=t['id']) }}" onsubmit="return confirm('Delete this template?')">
+        <button class="button small ghost danger-hover" type="submit">Delete</button>
+      </form>
+    </div>
+  </article>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty panel">
+  <div class="empty-icon">▦</div>
+  <h3>No templates yet</h3>
+  <p>Load our pre-calibrated answer sheet templates (30Q, 50Q, 60Q, 100Q) with matching printable & fillable PDFs, or create a custom one.</p>
+  <div class="hero-actions" style="justify-content: center; margin-top: 15px; gap: 10px; flex-wrap: wrap;">
+    <form method="post" action="{{ url_for('seed_templates') }}" style="display:inline;">
+      <button class="button primary" type="submit">⚡ Load Standard Templates (30Q, 50Q, 60Q, 100Q)</button>
+    </form>
+    <a class="button secondary" href="{{ url_for('new_template') }}">Create custom template</a>
+    <a class="button ghost" href="{{ url_for('sample_pdf', count=60) }}">Download Sample 60Q Sheet (PDF)</a>
+  </div>
+</div>
+{% endif %}
+
+<div class="section-head">
+  <h2>Recent results</h2>
+  <span class="muted">Latest 10</span>
+</div>
+{% if results %}
+<div class="panel table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Test</th>
+        <th>Date</th>
+        <th>Questions</th>
+        <th>Score</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in results %}
+      <tr>
+        <td><strong>{{ r['test_name'] }}</strong><small>{{ r['filename'] }}</small></td>
+        <td>{{ r['created_at'][:10] }}</td>
+        <td>{{ r['question_count'] }}</td>
+        <td><span class="score-pill">{{ r['score']|int }} / {{ r['question_count'] }}</span></td>
+        <td><a href="{{ url_for('result_detail', result_id=r['id']) }}">View →</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="empty compact">
+  <p>Your scored tests will appear here.</p>
+</div>
+{% endif %}
+{% endblock %}

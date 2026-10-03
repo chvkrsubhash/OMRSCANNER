@@ -1,0 +1,10 @@
+{% extends "base.html" %}{% block title %}Create account{% endblock %}
+{% block content %}
+<div class="auth-wrap"><div class="panel auth-panel"><div class="eyebrow">GET STARTED</div><h1>Create your account</h1><p class="muted">Your templates and test history stay linked to your account.</p>
+<form method="post" class="form">
+<label>Username<input name="username" minlength="3" required autocomplete="username" placeholder="e.g. agent_01"></label>
+<label>Email<input type="email" name="email" required autocomplete="email" placeholder="you@example.com"></label>
+<label>Password<input type="password" name="password" minlength="8" required autocomplete="new-password" placeholder="At least 8 characters"></label>
+<button class="button primary full" type="submit">Create account</button>
+</form><p class="form-foot">Already registered? <a href="{{ url_for('login') }}">Sign in</a></p></div></div>
+{% endblock %}

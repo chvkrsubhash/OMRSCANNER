@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Digital OMR Scanner{% endblock %}
+{% block content %}
+<section class="hero">
+  <div class="eyebrow">PDF IN · RESULTS OUT</div>
+  <h1>Turn your practice<br><span>sheet into a score.</span></h1>
+  <p class="lead">Upload a digitally filled OMR PDF, apply your custom answer-sheet template, and keep every practice result in one place.</p>
+  <div class="hero-actions"><a class="button primary" href="{{ url_for('register') }}">Create free account →</a><a class="button secondary" href="{{ url_for('login') }}">Sign in</a></div>
+  <div class="hero-note"><span class="dot"></span> Custom question counts · +1 correct · No negative marking</div>
+</section>
+<section class="feature-grid">
+  <article class="feature"><div class="feature-icon">↗</div><h3>PDF scanning</h3><p>Read interactive PDF form fields or detect marked bubbles using a configured visual grid.</p></article>
+  <article class="feature"><div class="feature-icon">⌘</div><h3>Custom templates</h3><p>Set question count, answer options, page, and bubble coordinates for your own sheet.</p></article>
+  <article class="feature"><div class="feature-icon">▤</div><h3>Saved history</h3><p>Review scores and question-by-question responses, then export results to CSV.</p></article>
+</section>
+<div class="notice"><strong>Note:</strong> Arbitrary PDF layouts need template calibration. Always review unclear detections before relying on the score.</div>
+{% endblock %}
