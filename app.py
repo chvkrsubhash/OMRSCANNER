@@ -14,7 +14,10 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(APP_DIR, "instance")
+if os.environ.get("VERCEL"):
+    DATA_DIR = os.path.join("/tmp", "instance")
+else:
+    DATA_DIR = os.path.join(APP_DIR, "instance")
 UPLOAD_DIR = os.path.join(DATA_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "omr.sqlite3")
