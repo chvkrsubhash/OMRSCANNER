@@ -1,7 +1,7 @@
 import os, json, sqlite3, hashlib, secrets, re
 from datetime import datetime
 from functools import wraps
-from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file, abort
+from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file, abort, send_from_directory
 from werkzeug.utils import secure_filename
 import fitz
 import cv2
@@ -128,9 +128,18 @@ def sync_result_to_firestore(result_data):
     except Exception:
         pass
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    static_folder=os.path.join(APP_DIR, "static"),
+    static_url_path="/static",
+    template_folder=os.path.join(APP_DIR, "templates")
+)
 app.secret_key = os.environ.get("SECRET_KEY", "replace-this-with-a-long-random-secret")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB for batch uploads
+
+@app.route("/static/<path:filename>")
+def serve_static(filename):
+    return send_from_directory(os.path.join(APP_DIR, "static"), filename)
 
 @app.context_processor
 def inject_firebase():
