@@ -31,5 +31,21 @@
     {% block content %}{% endblock %}
   </main>
   <footer class="footer">OMR Desk · Personal exam practice workspace</footer>
+
+  {% if FIREBASE_CONFIG and FIREBASE_CONFIG.apiKey %}
+  <!-- Firebase App & Auth SDK -->
+  <script src="https://www.gstatic.com/firebasejs/10.9.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.9.0/firebase-auth-compat.js"></script>
+  <script>
+    const firebaseConfig = {{ FIREBASE_CONFIG|tojson }};
+    if (firebaseConfig && firebaseConfig.apiKey && typeof firebase !== 'undefined') {
+      if (!firebase.apps.length) {
+        firebase.initializeApp(firebaseConfig);
+        console.log("Firebase initialized for project:", firebaseConfig.projectId);
+      }
+    }
+  </script>
+  {% endif %}
 </body>
 </html>
+

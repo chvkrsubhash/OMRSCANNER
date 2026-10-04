@@ -12,6 +12,11 @@ import zipfile
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from dotenv import load_dotenv
+import boto3
+import requests
+
+load_dotenv()
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if os.environ.get("VERCEL"):
@@ -23,9 +28,122 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "omr.sqlite3")
 ALLOWED_EXTENSIONS = {"pdf"}
 
+# AWS S3 Storage Configuration
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AWS_S3_BUCKET = os.environ.get("AWS_S3_BUCKET", "")
+AWS_S3_PREFIX = os.environ.get("AWS_S3_PREFIX", "weekly-rough-work").strip("/")
+AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+
+_s3_client = None
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+    if AWS_S3_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        try:
+            _s3_client = boto3.client(
+                "s3",
+                region_name=AWS_REGION,
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            )
+            return _s3_client
+        except Exception as e:
+            print(f"[S3 Init Error] {e}")
+    return None
+
+def s3_upload_file(local_path_or_bytes, s3_subpath, content_type="application/pdf"):
+    """Upload a file or raw bytes to S3 bucket under AWS_S3_PREFIX with local fallback."""
+    client = get_s3_client()
+    if not client or not AWS_S3_BUCKET:
+        return None
+    key = f"{AWS_S3_PREFIX}/{s3_subpath.lstrip('/')}"
+    try:
+        if isinstance(local_path_or_bytes, (bytes, bytearray)):
+            client.put_object(Bucket=AWS_S3_BUCKET, Key=key, Body=local_path_or_bytes, ContentType=content_type)
+        else:
+            with open(local_path_or_bytes, "rb") as f:
+                client.put_object(Bucket=AWS_S3_BUCKET, Key=key, Body=f.read(), ContentType=content_type)
+        return key
+    except Exception as e:
+        print(f"[S3 Upload Notice] {key}: {e}")
+        return None
+
+def s3_download_file(s3_subpath):
+    """Download a file's raw bytes from S3 bucket under AWS_S3_PREFIX."""
+    client = get_s3_client()
+    if not client or not AWS_S3_BUCKET:
+        return None
+    key = f"{AWS_S3_PREFIX}/{s3_subpath.lstrip('/')}"
+    try:
+        res = client.get_object(Bucket=AWS_S3_BUCKET, Key=key)
+        return res["Body"].read()
+    except Exception as e:
+        return None
+
+def sync_db_from_s3():
+    """Restore database from S3 backup if local database is missing (useful for Vercel cold starts)."""
+    if not os.path.exists(DB_PATH) or os.path.getsize(DB_PATH) == 0:
+        db_bytes = s3_download_file("omr-db/omr.sqlite3")
+        if db_bytes:
+            try:
+                os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+                with open(DB_PATH, "wb") as f:
+                    f.write(db_bytes)
+                print("[S3 Sync] Restored omr.sqlite3 from S3!")
+            except Exception as e:
+                print(f"[S3 Sync Warning] {e}")
+
+def sync_db_to_s3():
+    """Backup database to S3 so changes persist across serverless restarts."""
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        try:
+            with open(DB_PATH, "rb") as f:
+                s3_upload_file(f.read(), "omr-db/omr.sqlite3", content_type="application/x-sqlite3")
+        except Exception as e:
+            pass
+
+def sync_result_to_firestore(result_data):
+    """Sync scan evaluation results to Firebase Firestore via REST API if configured."""
+    project_id = os.environ.get("FIREBASE_PROJECT_ID")
+    api_key = os.environ.get("FIREBASE_API_KEY")
+    if not project_id or not api_key:
+        return
+    try:
+        url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/omr_evaluations?key={api_key}"
+        doc_fields = {
+            "test_name": {"stringValue": str(result_data.get("test_name", ""))},
+            "candidate_name": {"stringValue": str(result_data.get("candidate_name", ""))},
+            "roll_number": {"stringValue": str(result_data.get("roll_number", ""))},
+            "score": {"doubleValue": float(result_data.get("score", 0.0))},
+            "question_count": {"integerValue": str(result_data.get("question_count", 0))},
+            "correct_count": {"integerValue": str(result_data.get("correct_count", 0))},
+            "incorrect_count": {"integerValue": str(result_data.get("incorrect_count", 0))},
+            "unanswered_count": {"integerValue": str(result_data.get("unanswered_count", 0))},
+            "created_at": {"stringValue": str(result_data.get("created_at", datetime.utcnow().isoformat()))}
+        }
+        requests.post(url, json={"fields": doc_fields}, timeout=2.0)
+    except Exception:
+        pass
+
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "replace-this-with-a-long-random-secret")
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB for batch uploads
+
+@app.context_processor
+def inject_firebase():
+    return {
+        "FIREBASE_CONFIG": {
+            "apiKey": os.environ.get("FIREBASE_API_KEY", ""),
+            "authDomain": os.environ.get("FIREBASE_AUTH_DOMAIN", ""),
+            "projectId": os.environ.get("FIREBASE_PROJECT_ID", ""),
+            "storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET", ""),
+            "messagingSenderId": os.environ.get("FIREBASE_MESSAGING_SENDER_ID", ""),
+            "appId": os.environ.get("FIREBASE_APP_ID", "")
+        }
+    }
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -34,6 +152,7 @@ def db():
     return conn
 
 def init_db():
+    sync_db_from_s3()
     with db() as con:
         con.executescript("""
         CREATE TABLE IF NOT EXISTS users (
@@ -741,6 +860,8 @@ def get_evaluated_pdf_for_result(result, upload_dir):
                     source_bytes = f.read()
             except Exception:
                 pass
+        if not source_bytes:
+            source_bytes = s3_download_file(f"omr-uploads/{stored_name}")
 
     if not source_bytes:
         doc = generate_omr_pdf(template_name, cfg, interactive=False)
@@ -761,7 +882,10 @@ def get_evaluated_pdf_for_result(result, upload_dir):
         "roll_number": result.get("roll_number") or ""
     }
 
-    return annotate_evaluated_omr(source_bytes, cfg, details, score_summary, student_info)
+    eval_bytes = annotate_evaluated_omr(source_bytes, cfg, details, score_summary, student_info)
+    if stored_name:
+        s3_upload_file(eval_bytes, f"omr-evaluated/{stored_name}")
+    return eval_bytes
 
 def generate_batch_excel_workbook(results_list, test_name="OMR Evaluation", template_name="Standard Template"):
     """Generate a multi-sheet formatted Excel workbook (.xlsx) with:
@@ -1215,6 +1339,7 @@ def register():
             with db() as con:
                 con.execute("INSERT INTO users(username,email,password_hash,created_at) VALUES(?,?,?,?)",
                             (username, email, hash_password(password), datetime.utcnow().isoformat(timespec="seconds")))
+            sync_db_to_s3()
             flash("Account created. Please sign in.", "success")
             return redirect(url_for("login"))
         except sqlite3.IntegrityError:
@@ -1421,6 +1546,7 @@ def new_template():
             with db() as con:
                 con.execute("INSERT INTO templates(user_id,name,config_json,created_at) VALUES(?,?,?,?)",
                             (session["user_id"], name, json.dumps(cfg), datetime.utcnow().isoformat(timespec="seconds")))
+            sync_db_to_s3()
             flash("Template saved! You can now download your printable OMR sheet or score a completed test.", "success")
             return redirect(url_for("dashboard"))
         except (ValueError, TypeError) as e:
@@ -1432,6 +1558,7 @@ def new_template():
 def delete_template(template_id):
     with db() as con:
         con.execute("DELETE FROM templates WHERE id=? AND user_id=?", (template_id, session["user_id"]))
+    sync_db_to_s3()
     flash("Template deleted.", "success")
     return redirect(url_for("dashboard"))
 
@@ -1494,6 +1621,7 @@ def scan():
                 unique_name = f"{secrets.token_hex(8)}_{orig_filename}"
                 path = os.path.join(UPLOAD_DIR, unique_name)
                 upload.save(path)
+                s3_upload_file(path, f"omr-uploads/{unique_name}")
 
                 try:
                     doc = fitz.open(path)
@@ -1548,6 +1676,18 @@ def scan():
                             batch_id, roll_no, cand_name, unique_name
                         ))
                         created_ids.append(cur.lastrowid)
+
+                    sync_db_to_s3()
+                    sync_result_to_firestore({
+                        "test_name": test_name,
+                        "candidate_name": cand_name,
+                        "roll_number": roll_no,
+                        "score": score,
+                        "question_count": cfg["question_count"],
+                        "correct_count": correct,
+                        "incorrect_count": incorrect,
+                        "unanswered_count": unanswered
+                    })
                 except Exception as file_err:
                     errors.append(f"{orig_filename}: {file_err}")
 
@@ -1766,6 +1906,7 @@ def export_all_excel():
 def delete_result(result_id):
     with db() as con:
         con.execute("DELETE FROM results WHERE id=? AND user_id=?", (result_id, session["user_id"]))
+    sync_db_to_s3()
     flash("Result deleted.", "success")
     return redirect(url_for("dashboard"))
 
